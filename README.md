@@ -4,6 +4,16 @@ OpenAI/Anthropic-compatible local API bridge for [OpenCode](https://opencode.ai)
 
 It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible client (9Router, Cursor, Continue, LiteLLM, Open WebUI, or the OpenAI SDK) can call directly.
 
+## Origin
+
+This repository packages the bridge from
+[azrinaldi/opencode-free-bridge](https://github.com/azrinaldi/opencode-free-bridge)
+(kept as the `upstream` remote) as a TypeScript runtime and an OMP/pi plugin.
+Upstream remains the source for the installer download path and the
+self-updater; this repository is what npm publishes and what
+`omp plugin install` fetches.
+
+
 ## What's New in v2.0.0
 
 - **Bun TLS transport parity:** The official OpenCode CLI ships as a compiled Bun binary, and upstream's free-tier gate inspects the TLS `ClientHello` fingerprint (17 cipher suites and 12 TLS extensions in exact order). The bridge runs on Bun (`bun server.ts`), blocks accidental Node.js startups unless `ALLOW_NODE=1` is set for offline tests, and ships `transport-fingerprint.ts` to verify TLS parity against `transport-baseline.json`.

@@ -71,11 +71,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/azrinaldi/opencode-free-bridge.git"
+    "url": "git+https://github.com/yayayapluto/omp-opencode-free-bridge.git"
   },
-  "homepage": "https://github.com/azrinaldi/opencode-free-bridge#readme",
+  "homepage": "https://github.com/yayayapluto/omp-opencode-free-bridge#readme",
   "bugs": {
-    "url": "https://github.com/azrinaldi/opencode-free-bridge/issues"
+    "url": "https://github.com/yayayapluto/omp-opencode-free-bridge/issues"
   },
   "license": "MIT"
 }
