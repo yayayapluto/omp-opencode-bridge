@@ -1,6 +1,6 @@
-# opencode-free-bridge
+# omp-opencode-bridge
 
-OpenAI/Anthropic-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier models. No account and no API key required.
+OpenAI/Anthropic-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier models, shipped with the keyless OMP/pi plugin. No account and no API key required.
 
 It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible client (9Router, Cursor, Continue, LiteLLM, Open WebUI, or the OpenAI SDK) can call directly.
 
@@ -31,7 +31,7 @@ self-updater; this repository is what npm publishes and what
 - **Reasoning-aware token budgeting:** Applies an additive token floor (`max(requested, 1024) + 4096`) for reasoning models (determined from catalog `reasoning: true` metadata) so short prompts do not return empty content with `finish_reason: "length"`.
 - **Reasoning stream normalization:** Emits thinking tokens under `reasoning_content` for both streaming SSE and non-streaming JSON responses, and forwards client tool calls with automatic name de-collision (`read` -> `read_client` upstream, restored to `read` on return).
 - **Zero dependencies:** Uses only built-in runtime modules (`http`, `crypto`, `fs`, `path`, `net`, `tls`). No `npm install` step.
-- **OMP / pi plugin:** Ships `src/index.ts`, declared under `pi.extensions`, so `omp plugin install opencode-free-bridge` registers the local bridge as the keyless `opencode-free` provider and manages it with `/opencode-free`. No build step and still no dependencies beyond Node builtins.
+- **OMP / pi plugin:** Ships `src/index.ts`, declared under `pi.extensions`, so `omp plugin install omp-opencode-bridge` registers the local bridge as the keyless `opencode-free` provider and manages it with `/opencode-free`. No build step and still no dependencies beyond Node builtins.
 - **Container deployment:** Ships a `Dockerfile` and `docker-compose.yaml` (contributed in PR #1 by @rustam76, completed in v2.1.0). The image pins `oven/bun:1.4.3-slim` — the Bun version is pinned because the free-tier gate inspects the TLS `ClientHello` — runs as the non-root `bun` user, and publishes the port on loopback only.
 
 ## Requirements: Bun >= 1.0
@@ -178,7 +178,7 @@ The extension starts `bun server.ts` from the installed package on first use
 (reusing an already-running bridge) and stops nothing you started yourself.
 
 ```bash
-omp plugin install opencode-free-bridge     # from npm, once published
+omp plugin install omp-opencode-bridge     # from npm
 omp plugin install .                        # or link this working tree
 omp plugin list | grep opencode-free
 ```

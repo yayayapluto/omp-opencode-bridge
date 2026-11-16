@@ -73,7 +73,7 @@ so an in-place self-update would be reverted by the next build.
 ### Option D: OMP / pi plugin
 
 The package doubles as an `omp` extension (`"pi": { "extensions": ["./src/index.ts"] }`).
-`omp plugin install opencode-free-bridge` (or `omp plugin install .` for a working
+`omp plugin install omp-opencode-bridge` (or `omp plugin install .` for a working
 tree) registers the `opencode-free` provider; the extension starts `bun server.ts`
 from the installed package, reuses an already-healthy bridge on the port, and
 re-reads `/v1/models`. Control it with `/opencode-free status|models|refresh-models|start|stop|restart|health|logs`.

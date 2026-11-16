@@ -3,7 +3,7 @@
 
 The same package is now an OMP / pi plugin.
 
-`omp plugin install opencode-free-bridge` registers the local bridge as the
+`omp plugin install omp-opencode-bridge` registers the local bridge as the
 keyless `opencode-free` provider: the extension starts `bun server.ts` from the
 installed package (reusing a bridge that is already listening), re-reads
 `/v1/models`, and exposes control through `/opencode-free`.
@@ -23,6 +23,11 @@ installed package (reusing a bridge that is already listening), re-reads
   other installed plugins that ship TypeScript), keywords `pi-package`,
   `pi-extension`, `omp`, optional peer on `@earendil-works/pi-coding-agent`,
   and npm repository/homepage/bugs metadata for the marketplace listing.
+- **Package name:** the npm package and repository are `omp-opencode-bridge`
+  (`github.com/yayayapluto/omp-opencode-bridge`). The runtime service name,
+  the state directory `~/.opencode-free-bridge`, the `OPENCODE_*` environment
+  variables and the provider id `opencode-free` did not move, so existing
+  installs keep working.
 - **Proof:** `omp plugin doctor` → 12 ok, 0 errors; a live
   `omp --model opencode-free/mimo-v2.6-flash-free -p "..."` answered `OK`
   through an extension-spawned bridge.

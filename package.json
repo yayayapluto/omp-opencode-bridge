@@ -1,7 +1,7 @@
 {
-  "name": "opencode-free-bridge",
+  "name": "omp-opencode-bridge",
   "version": "2.6.0",
-  "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required), self-adapting to gate changes; also an OMP/pi plugin",
+  "description": "OpenCode free-tier models for OMP/pi: a local OpenAI-compatible bridge (no account required) plus the keyless provider plugin",
   "main": "server.ts",
   "bin": {
     "opencode-free-bridge": "server.ts"
@@ -71,11 +71,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yayayapluto/omp-opencode-free-bridge.git"
+    "url": "git+https://github.com/yayayapluto/omp-opencode-bridge.git"
   },
-  "homepage": "https://github.com/yayayapluto/omp-opencode-free-bridge#readme",
+  "homepage": "https://github.com/yayayapluto/omp-opencode-bridge#readme",
   "bugs": {
-    "url": "https://github.com/yayayapluto/omp-opencode-free-bridge/issues"
+    "url": "https://github.com/yayayapluto/omp-opencode-bridge/issues"
   },
   "license": "MIT"
 }
