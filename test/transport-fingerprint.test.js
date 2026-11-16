@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert");
-const { parseClientHello, capture } = require("../transport-fingerprint.js");
+const { parseClientHello, capture } = require("../transport-fingerprint.ts");
 
 test("parseClientHello reads ciphers and extension order from raw bytes", async () => {
   // Use the runtime's own ClientHello: this asserts the parser against a real

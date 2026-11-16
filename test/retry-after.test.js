@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-// server.js reads state from disk at require time; give it a throwaway dir so
+// server.ts reads state from disk at require time; give it a throwaway dir so
 // the test cannot touch a real installation.
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ofb-retryafter-test-"));
 process.env.OPENCODE_BRIDGE_STATE_DIR = tmpDir;

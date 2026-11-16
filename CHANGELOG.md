@@ -1,4 +1,64 @@
 # Changelog
+## [2.6.0] — 2026-11-16
+
+The same package is now an OMP / pi plugin.
+
+`omp plugin install opencode-free-bridge` registers the local bridge as the
+keyless `opencode-free` provider: the extension starts `bun server.ts` from the
+installed package (reusing a bridge that is already listening), re-reads
+`/v1/models`, and exposes control through `/opencode-free`.
+
+- **Extension (`src/index.ts`):** a structural `ExtensionAPI` (only the three
+  calls used are typed) keeps the runtime dependency-free; models carry zeroed
+  cost and a 128k/16k window/ceiling. `ensureBridge` waits up to 20 s for
+  `/health`; pid, log and model cache live in
+  `~/.opencode-free-bridge/omp-plugin.json`, `omp-plugin.log` and
+  `omp-models.json`.
+- **Model discovery is synchronous on load.** A background refresh loses the
+  race with `omp --model <provider>/<id>`, which resolves model ids before the
+  first turn — measured, the first build registered an empty list and the CLI
+  answered `Model "..." not found`. The cached list is registered first, then
+  the live list replaces it before the extension factory returns.
+- **Manifest:** `pi.extensions` → `./src/index.ts` (no build step, matching
+  other installed plugins that ship TypeScript), keywords `pi-package`,
+  `pi-extension`, `omp`, optional peer on `@earendil-works/pi-coding-agent`,
+  and npm repository/homepage/bugs metadata for the marketplace listing.
+- **Proof:** `omp plugin doctor` → 12 ok, 0 errors; a live
+  `omp --model opencode-free/mimo-v2.6-flash-free -p "..."` answered `OK`
+  through an extension-spawned bridge.
+
+## [2.5.0] — 2026-11-16
+
+TypeScript across the runtime, and a cold start that no longer parses 6.5 MB.
+
+Every runtime module is now `.ts` (`server`, `identity`, `proxy`, `panel`,
+`anthropic`, `egress-proxy`, `transport-fingerprint`, `token-budget`,
+`gate-drill`, `verify`). Bun executes TypeScript natively, so there is no build
+step and still zero dependencies; the types are erasable-only so Node 24+ can
+still run the offline test suite by type stripping.
+
+- **Compact catalog cache (`identity.ts`):** the disk cache stored upstream's
+  full `api.json` — 6.5 MB on this machine — and every boot paid ~9 ms of disk
+  read plus ~40 ms of `JSON.parse` for fields the bridge never reads. The cache
+  now stores only the projection `parseCatalogData` consumes (prices, status,
+  tool_call, reasoning, limits, family, provider routes), so a cache written by
+  this version is ~2% of the size and the boot parse drops to sub-millisecond.
+  A cache written by an older build (the full document) still loads unchanged;
+  it is replaced on the next successful fetch.
+- **Installer completeness (`install.sh`):** the installer fetched neither
+  `anthropic.ts` nor `egress-proxy.ts`, yet `server.ts` hard-requires
+  `anthropic` at boot — a fresh Linux install would crash on first start and
+  rely on the boot-time repair fetch. Both are now fetched, syntax-checked and
+  installed like the other modules. The installer's syntax check understands
+  TypeScript (`Bun.Transpiler`, `new Function` remains the Node fallback).
+- **Self-updater (`server.ts`):** `UPDATE_FILES`, `localRequires` and
+  `repairMissingModules` all speak `.ts`, and downloaded modules are parsed
+  with `Bun.Transpiler` instead of `new Function` (which cannot parse
+  TypeScript).
+- **Delivery:** `package.json` (`main`, `bin`, `files`, scripts), `Dockerfile`
+  (`CMD bun server.ts`), CI and the docs now name the `.ts` files. The test
+  suite stays CommonJS `.js` and runs under `bun test`.
+
 ## [2.4.0] — 2026-11-10
 
 Anthropic's Messages API, with streaming that is actually streamed.

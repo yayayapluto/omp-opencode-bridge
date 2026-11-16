@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * identity.js — adaptive OpenCode CLI identity & security-layer sync.
+ * identity.ts — adaptive OpenCode CLI identity & security-layer sync.
  *
  * Keeps the bridge aligned with the official OpenCode CLI when upstream adjusts
  * its free-tier gate (User-Agent version floor, session ID format, headers, or
@@ -33,14 +33,139 @@ const crypto = require("crypto");
 // `global.fetch` keep intercepting every call.
 //
 // Loaded tolerantly: a 2.1.0 install updated by its own (older) updater can be
-// missing `proxy.js`, and identity sync must degrade to direct egress rather
+// missing `proxy.ts`, and identity sync must degrade to direct egress rather
 // than crash the process that would otherwise repair itself.
-let proxy;
+let proxy: any;
 try {
   proxy = require("./proxy");
 } catch (err) {
   if (err.code !== "MODULE_NOT_FOUND" || !String(err.message).includes("'./proxy'")) throw err;
-  proxy = { netFetch: (url, init) => fetch(url, init) };
+  proxy = { netFetch: (url: any, init: any) => fetch(url, init) };
+}
+
+// --- Shape interfaces (erasable-only TS; upstream payloads stay `any`) --------
+
+interface Recipe {
+  channel: string;
+  version: string;
+  client: string;
+  sessionPrefix: string;
+  sessionCharset: string;
+  sessionLength: number;
+  sessionMultiplier: number;
+  userAgentTemplate: string;
+  chatUrl: string;
+  responsesUrl: string;
+  modelsUrl: string;
+  catalogBase: string;
+  headers: string[];
+}
+
+interface ToolDef {
+  description: string | null;
+  parameters: any;
+}
+type ToolProfile = Record<string, ToolDef>;
+
+interface ModelFacts {
+  reasoning: boolean;
+  maxOutput: number | null;
+}
+
+interface ExtractedTool {
+  name: string;
+  description: string | null;
+  descriptionFile?: string;
+  descriptionVar?: string;
+  parameters: any;
+}
+
+interface ReleaseInfo {
+  version: string | null;
+  sha: string | null;
+  minimum: boolean;
+  active: boolean;
+  channel: string;
+  source: string;
+  resolvedAt: number | null;
+  stale: boolean;
+  degraded?: string;
+  error?: string;
+}
+
+interface SourceCacheEntry {
+  ref: string;
+  extracted: Record<string, any>;
+  savedAt?: number;
+}
+
+interface ToolOverrides {
+  condition: string;
+  whenTrueRemove: string[];
+  whenTrueAdd: string[];
+  whenFalseRemove: string[];
+  whenFalseAdd: string[];
+}
+
+interface DynamicDescriptionSpec {
+  appendPrefix: string[];
+  joiner: string;
+  itemTemplate: string | null;
+}
+
+interface CatalogProjection {
+  catalogBase?: string;
+  chatUrl?: string;
+  responsesUrl?: string;
+  modelEndpoints?: Record<string, string>;
+  freeModels?: string[];
+  catalogVerdicts?: Record<string, string>;
+  modelFacts?: Record<string, ModelFacts>;
+  modelFamilies?: Record<string, string>;
+  fromCache?: boolean;
+}
+
+interface RecipeUpdate {
+  sessionCharset?: string;
+  sessionLength?: number;
+  sessionMultiplier?: number;
+  sessionPrefix?: string;
+  userAgentTemplate?: string;
+  headers?: string[];
+  optionalHeaders?: string[];
+  tools?: ToolProfile;
+  toolNames?: string[];
+  toolOverrides?: ToolOverrides;
+  dynamicDescriptions?: Record<string, DynamicDescriptionSpec>;
+}
+
+interface StructParse {
+  properties: Record<string, any>;
+  required: string[];
+  additionalProperties: boolean;
+}
+
+interface Endpoints {
+  chatUrl: string;
+  responsesUrl: string;
+  modelsUrl: string;
+  catalogBase: string;
+}
+
+interface GateContext {
+  userAgent?: string;
+  client?: string;
+  project?: string;
+  sessionId?: string;
+}
+
+interface GateRejectionResult {
+  retry: boolean;
+  reason: string;
+  status?: number;
+  errType?: any;
+  terminal?: boolean;
+  cooldown?: boolean;
 }
 
 const UPDATE_API_BASE =
@@ -267,32 +392,32 @@ const GATE_ANCHOR_TOOL_NAMES = ["read"];
  */
 const GATE_ANCHOR_HEADER_NAMES = ["user-agent", "x-opencode-session", "x-session-affinity"];
 
-let recipe = { ...DEFAULT_RECIPE };
-let toolProfile = null;
-let toolProfileSource = "default";
-let toolProfileVersion = DEFAULT_RECIPE.version;
+let recipe: Recipe = { ...DEFAULT_RECIPE };
+let toolProfile: ToolProfile | null = null;
+let toolProfileSource: string = "default";
+let toolProfileVersion: string = DEFAULT_RECIPE.version;
 // The gate allowlist: tool names upstream accepts. Derived from the tool plugin
 // sources at the release SHA; the wire sends these names (schema is not
 // fingerprinted). Empty = fall back to the tool profile's own key order.
-let toolNames = [];
+let toolNames: string[] = [];
 // Per-model route overrides from the provider catalog (model id -> base URL).
-let modelEndpoints = {};
+let modelEndpoints: Record<string, string> = {};
 // Free-tier model ids derived from the provider catalog (zero cost, not
 // deprecated). Empty until the first successful catalog read.
-let freeModels = [];
+let freeModels: string[] = [];
 // id → "free" | "paid" | "deprecated", straight from the provider catalog.
-let catalogVerdicts = {};
+let catalogVerdicts: Record<string, string> = {};
 // Kee 2026-11-10: upstream still serves these ids on the free tier while the
 // catalog marks them deprecated. Keep them exposed; a priced entry stays out.
 const FREE_VERDICT_OVERRIDES = Object.freeze(["minimax-m3.1-flash-free"]);
 // catalog family → a free model id in that family (e.g. "nemotron-free").
-let modelFamilies = {};
+let modelFamilies: Record<string, string> = {};
 // id → { reasoning: boolean, maxOutput: number|null } from the catalog.
-let modelFacts = {};
+let modelFacts: Record<string, ModelFacts> = {};
 // Model-conditional tool swaps read from the release (see extractToolOverrides).
-let toolOverrides = null;
+let toolOverrides: ToolOverrides | null = null;
 // Tool descriptions the CLI extends at request time (see extractDynamicDescriptions).
-let dynamicDescriptions = null;
+let dynamicDescriptions: Record<string, DynamicDescriptionSpec> | null = null;
 // Tool plugin basenames last seen in the release tree. Seeded with the current
 // set so the first refresh works even if the directory listing fails.
 let knownPlugins = [
@@ -311,34 +436,34 @@ let knownPlugins = [
   "websearch",
   "write",
 ];
-let lastRelease = null;
-let lastAvailable = null;
-let lastCheckTime = 0;
-let refreshInFlight = null;
-let refreshInFlightForced = false;
-let versionFloor = null;
-let lastRefreshError = null;
-let lastSourceTag = null;
-let optionalHeaders = [];
-let lastForcedRefreshTime = 0;
-let stateEpoch = 0;
-let refreshGen = 0;
-let lastSyncedSource = null;
+let lastRelease: ReleaseInfo | null = null;
+let lastAvailable: string | null = null;
+let lastCheckTime: number = 0;
+let refreshInFlight: Promise<any> | null = null;
+let refreshInFlightForced: boolean = false;
+let versionFloor: string | null = null;
+let lastRefreshError: string | null = null;
+let lastSourceTag: string | null = null;
+let optionalHeaders: string[] = [];
+let lastForcedRefreshTime: number = 0;
+let stateEpoch: number = 0;
+let refreshGen: number = 0;
+let lastSyncedSource: { ref: string; extracted: Record<string, any>; fetchRef: any } | null = null;
 
-function stableStringify(val) {
+function stableStringify(val: any): string {
   if (!val || typeof val !== "object") return JSON.stringify(val);
   if (Array.isArray(val)) return "[" + val.map(stableStringify).join(",") + "]";
   const keys = Object.keys(val).sort();
   return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(val[k])).join(",") + "}";
 }
 
-function clampString(value, max) {
+function clampString(value: any, max: number): string | null {
   return typeof value === "string" && value.length > 0 && value.length <= max ? value : null;
 }
 
 // --- Version & Handshake Helpers ---------------------------------------------
 
-function sortVersions(list) {
+function sortVersions(list: any[]): string[] {
   const seen = new Set();
   return list
     .filter((v) => typeof v === "string" && /^\d+\.\d+\.\d+$/.test(v))
@@ -350,7 +475,7 @@ function sortVersions(list) {
     });
 }
 
-function parseVersions(text) {
+function parseVersions(text: any): string[] {
   const found = [];
   const re = /<title>v?(\d+\.\d+\.\d+)<\/title>/gi;
   let m;
@@ -358,7 +483,7 @@ function parseVersions(text) {
   return sortVersions(found);
 }
 
-function selectVersion(versions) {
+function selectVersion(versions: any): string | null {
   if (!Array.isArray(versions) || versions.length === 0) return null;
   const pinned = process.env.OPENCODE_MAJOR;
   if (pinned && /^\d+$/.test(pinned)) {
@@ -367,7 +492,7 @@ function selectVersion(versions) {
   return versions[0];
 }
 
-function compareVersions(a, b) {
+function compareVersions(a: any, b: any): number {
   const [a1, a2, a3] = String(a).split(".").map(Number);
   const [b1, b2, b3] = String(b).split(".").map(Number);
   if (a1 !== b1) return a1 - b1;
@@ -375,18 +500,18 @@ function compareVersions(a, b) {
   return a3 - b3;
 }
 
-function parseVersionFloor(message) {
+function parseVersionFloor(message: any): string | null {
   const m = String(message || "").match(/(\d+\.\d+\.\d+)\s+or newer/i);
   return m ? m[1] : null;
 }
 
-function sourceRef(release) {
+function sourceRef(release: any): string {
   if (release && release.sha) return release.sha;
   if (release && release.version) return `v${release.version}`;
   return process.env.OPENCODE_SOURCE_REF || "dev";
 }
 
-async function fetchJson(url, timeoutMs = HANDSHAKE_TIMEOUT_MS) {
+async function fetchJson(url: string, timeoutMs: number = HANDSHAKE_TIMEOUT_MS): Promise<any> {
   const res = await proxy.netFetch(url, {
     signal: AbortSignal.timeout(timeoutMs),
     headers: { accept: "application/json" },
@@ -395,7 +520,7 @@ async function fetchJson(url, timeoutMs = HANDSHAKE_TIMEOUT_MS) {
   return res.json();
 }
 
-async function fetchText(url, timeoutMs = SOURCE_TIMEOUT_MS) {
+async function fetchText(url: string, timeoutMs: number = SOURCE_TIMEOUT_MS): Promise<string> {
   const res = await proxy.netFetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.text();
@@ -410,7 +535,7 @@ async function fetchText(url, timeoutMs = SOURCE_TIMEOUT_MS) {
  * uses the contents API once per refresh; a failure returns an empty list and
  * the caller falls back to the previously known set.
  */
-async function listSourceDir(dir, ref, timeoutMs = SOURCE_TIMEOUT_MS) {
+async function listSourceDir(dir: string, ref: string, timeoutMs: number = SOURCE_TIMEOUT_MS): Promise<string[]> {
   try {
     const res = await proxy.netFetch(
       `${GITHUB_API}/repos/${REPO}/contents/${dir}?ref=${encodeURIComponent(ref)}`,
@@ -431,7 +556,7 @@ async function listSourceDir(dir, ref, timeoutMs = SOURCE_TIMEOUT_MS) {
  * Resolve the current authoritative CLI release via OpenCode's update handshake,
  * falling back to the GitHub Atom feed when the update API is unreachable.
  */
-async function resolveRelease(currentVersion = recipe.version) {
+async function resolveRelease(currentVersion: string = recipe.version): Promise<ReleaseInfo> {
   const channel = process.env.OPENCODE_CHANNEL || CHANNEL;
   const url =
     `${UPDATE_API_BASE}/${encodeURIComponent(channel)}/${encodeURIComponent(ARTIFACT)}` +
@@ -493,7 +618,7 @@ async function resolveRelease(currentVersion = recipe.version) {
 
 // --- Source Extraction (Recipe + Tool Definitions) ---------------------------
 
-function interpolateTemplate(str, vars) {
+function interpolateTemplate(str: string, vars: Record<string, any>): string {
   return str.replace(/\$\{([^}]+)\}/g, (_, expr) => {
     const key = expr.trim();
     if (vars[key] !== undefined) return String(vars[key]);
@@ -516,7 +641,7 @@ function interpolateTemplate(str, vars) {
  * Regexes with lazy quantifiers stop at the first `\n})`, which is how a struct
  * with a multi-line `.annotate({...})` lost the fields after it.
  */
-function readBalanced(source, openIndex) {
+function readBalanced(source: string, openIndex: number): string | null {
   const open = source[openIndex];
   const close = open === "{" ? "}" : open === "(" ? ")" : "]";
   let depth = 0;
@@ -541,15 +666,15 @@ function readBalanced(source, openIndex) {
 // Every source file fetched for the current release, joined. Cross-file schema
 // references are resolved against this when a plugin imports a struct or class
 // from a sibling module.
-let schemaCorpus = null;
+let schemaCorpus: string | null = null;
 // Numeric/constant bindings harvested from the corpus, used to interpolate
 // `${...}` inside descriptions.
-let schemaVars = null;
+let schemaVars: Record<string, any> | null = null;
 // basename → source text, for resolving `Namespace.Struct` references.
-let schemaModules = null;
+let schemaModules: Map<string, string> | null = null;
 
 /** `Schema.Struct({...})` → the full call text, matched by braces. */
-function readStructAt(source, indexOfStruct) {
+function readStructAt(source: string, indexOfStruct: number): string | null {
   const paren = source.indexOf("(", indexOfStruct);
   if (paren < 0) return null;
   const args = readBalanced(source, paren);
@@ -565,7 +690,7 @@ function readStructAt(source, indexOfStruct) {
  *   2. `input: LocationInput` inside `editor.add({...})`, defined above
  *   3. an inline `Schema.Struct({...})` passed as `input:`
  */
-function findInputSchema(source) {
+function findInputSchema(source: string): string | null {
   const inlineAt = source.search(/input:\s*Schema\.Struct\s*\(/);
   if (inlineAt >= 0) {
     const structAt = source.indexOf("Schema.Struct", inlineAt);
@@ -605,7 +730,7 @@ function findInputSchema(source) {
 
 /** Split a `{ a: x, b: y }` body at top-level commas (ignores nested braces,
  *  brackets, parens, strings, and template literals). */
-function splitTopLevel(body) {
+function splitTopLevel(body: string): string[] {
   const parts = [];
   let depth = 0;
   let start = 0;
@@ -630,7 +755,7 @@ function splitTopLevel(body) {
 }
 
 /** Undo the escapes that carry meaning in a description string. */
-function unescapeLiteral(text) {
+function unescapeLiteral(text: any): any {
   if (typeof text !== "string") return text;
   // A single left-to-right pass, so each escape is consumed exactly once.
   // Doing the replacements sequentially mangled `\\n` (an escaped backslash
@@ -657,7 +782,7 @@ function unescapeLiteral(text) {
 }
 
 /** Read a JS string/template literal body and unescape it. */
-function readStringLiteral(raw) {
+function readStringLiteral(raw: any): string | null {
   if (typeof raw !== "string") return null;
   const m = raw.match(/^\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)/s);
   if (!m) return null;
@@ -670,7 +795,7 @@ function readStringLiteral(raw) {
  * requiredness. This understands the constructors upstream uses and nothing
  * else; anything unrecognised degrades to `{ type: "string" }`.
  */
-function parseFieldSchema(expr, source) {
+function parseFieldSchema(expr: string, source: string): { required: boolean; schema: any } {
   let required = true;
   let schema = {};
 
@@ -827,7 +952,7 @@ function parseFieldSchema(expr, source) {
 }
 
 /** `Schema.Struct({...})` body → { properties, required, additionalProperties }. */
-function parseStructBody(body, source) {
+function parseStructBody(body: string, source: string): StructParse {
   const properties = {};
   const required = [];
   for (const part of splitTopLevel(body)) {
@@ -841,7 +966,7 @@ function parseStructBody(body, source) {
   return { properties, required, additionalProperties: false };
 }
 
-function parseSchemaExpr(expr, source) {
+function parseSchemaExpr(expr: any, source: string): StructParse | null {
   const text = String(expr);
   const structAt = text.indexOf("Schema.Struct");
   if (structAt < 0) return null;
@@ -871,7 +996,7 @@ function parseSchemaExpr(expr, source) {
 }
 
 /** Resolve `Question.Prompt` to the `Prompt` struct declared in the same file. */
-function resolveStructRef(name, source) {
+function resolveStructRef(name: string, source: string): any {
   const parts = String(name).split(".");
   const short = parts.pop();
   // For `Question.Prompt`, prefer the file that defines the `Question` module:
@@ -913,7 +1038,7 @@ function resolveStructRef(name, source) {
  * plugin imports rather than in the plugin itself — `read.ts` refers to
  * `ReadToolFileSystem.PageInput`, declared in `read-filesystem.ts`.
  */
-function resolveStructField(structName, field, source) {
+function resolveStructField(structName: string, field: string, source: string): { schema: any; optional: boolean } | null {
   for (const corpus of [source, typeof schemaCorpus === "string" ? schemaCorpus : null]) {
     if (!corpus) continue;
     for (const part of structFields(structName, corpus)) {
@@ -927,7 +1052,7 @@ function resolveStructField(structName, field, source) {
 }
 
 /** The field list of a struct/class declaration, wherever it appears. */
-function structFields(structName, corpus) {
+function structFields(structName: string, corpus: string): string[] {
   const out = [];
   // const X = Schema.Struct({ ... })
   const constAt = corpus.search(
@@ -960,7 +1085,7 @@ function structFields(structName, corpus) {
  * Extract a single tool's wire definition (`description` + JSON Schema `parameters`)
  * directly from its TypeScript plugin source (`read.ts` or `shell.ts`).
  */
-function extractToolFromSource(source, fallbackName) {
+function extractToolFromSource(source: any, fallbackName: string | null): ExtractedTool | null {
   if (typeof source !== "string" || !source.trim()) return null;
 
   const nameMatch = source.match(/export\s+const\s+name\s*=\s*"([a-z][a-z0-9_-]*)"/i);
@@ -1096,7 +1221,7 @@ function extractToolFromSource(source, fallbackName) {
  * would have been surfaced without a bridge release. Every resolved URL is
  * sanity-checked before adoption; a malformed catalog changes nothing.
  */
-function readCachedCatalog() {
+function readCachedCatalog(): any {
   try {
     const file = getCatalogCacheFile();
     if (!file) return null;
@@ -1109,7 +1234,35 @@ function readCachedCatalog() {
   return null;
 }
 
-function writeCachedCatalog(json) {
+/**
+ * The catalog fields this bridge actually reads.
+ *
+ * Upstream's `api.json` is ~6.5 MB, nearly all of it pricing tables, modalities
+ * and release metadata no code path here touches. Parsing it at every boot cost
+ * ~40 ms of the ~80 ms cold start, so the disk cache keeps only the projection
+ * `parseCatalogData` consumes — still shaped like a catalog (`opencode.models`)
+ * so `readCachedCatalog`/`parseCatalogData` need no second format, and a cache
+ * written by an older build (the full document) still loads unchanged.
+ */
+function compactCatalog(json: any): any {
+  const oc = json?.opencode;
+  if (!oc || typeof oc !== "object" || !oc.models || typeof oc.models !== "object") return json;
+  const models = {};
+  for (const [id, m] of Object.entries(oc.models)) {
+    models[id] = {
+      cost: { input: m?.cost?.input, output: m?.cost?.output },
+      status: m?.status,
+      tool_call: m?.tool_call,
+      reasoning: m?.reasoning,
+      limit: { output: m?.limit?.output },
+      family: m?.family,
+      provider: { api: m?.provider?.api, npm: m?.provider?.npm },
+    };
+  }
+  return { opencode: { api: oc.api, npm: oc.npm, models } };
+}
+
+function writeCachedCatalog(json: any): void {
   try {
     const dir = getCatalogCacheDir();
     const file = getCatalogCacheFile();
@@ -1117,7 +1270,7 @@ function writeCachedCatalog(json) {
     const fs = require("fs");
     fs.mkdirSync(dir, { recursive: true });
     const tmp = `${file}.tmp.${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify(json));
+    fs.writeFileSync(tmp, JSON.stringify(compactCatalog(json)));
     fs.renameSync(tmp, file);
   } catch {
     // A read-only home directory must not break the bridge; the fetch still
@@ -1125,7 +1278,7 @@ function writeCachedCatalog(json) {
   }
 }
 
-function readCachedSource(expectedRef = null) {
+function readCachedSource(expectedRef: string | null = null): SourceCacheEntry | null {
   try {
     const file = getSourceCacheFile();
     if (!file) return null;
@@ -1146,7 +1299,7 @@ function readCachedSource(expectedRef = null) {
   return null;
 }
 
-function writeCachedSource(ref, extracted) {
+function writeCachedSource(ref: string, extracted: any): void {
   if (!ref || !extracted || typeof extracted !== "object") return;
   try {
     const dir = getCatalogCacheDir();
@@ -1160,12 +1313,12 @@ function writeCachedSource(ref, extracted) {
   } catch {}
 }
 
-function isTrustedCatalogBaseUrl(url) {
+function isTrustedCatalogBaseUrl(url: any): boolean {
   return typeof url === "string" && /^https:\/\/([a-z0-9-]+\.)*opencode\.ai(\/|$)/i.test(url);
 }
 
-function parseCatalogData(json) {
-  const out = {};
+function parseCatalogData(json: any): CatalogProjection {
+  const out: CatalogProjection = {};
   const oc = json?.opencode;
   if (!oc || typeof oc !== "object") return out;
   const api = typeof oc.api === "string" ? oc.api.replace(/\/+$/, "") : null;
@@ -1213,7 +1366,7 @@ function parseCatalogData(json) {
     verdicts[key] = deprecated ? "deprecated" : zeroCost && usable ? "free" : "paid";
     if (verdicts[key] === "free") freeModels.push(id);
     // Model facts the wire depends on. `reasoning` decides whether the client's
-    // token budget needs thinking headroom (token-budget.js used to guess this
+    // token budget needs thinking headroom (token-budget.ts used to guess this
     // from substrings of the name), and `limit.output` caps a request.
     if (typeof m?.reasoning === "boolean") {
       modelFacts[key] = {
@@ -1250,7 +1403,7 @@ function parseCatalogData(json) {
   return out;
 }
 
-async function extractCatalog() {
+async function extractCatalog(): Promise<CatalogProjection> {
   let json;
   let fromCache = false;
   try {
@@ -1284,7 +1437,7 @@ async function extractCatalog() {
  * the list from that flag means a tool that moves into code mode drops out and
  * a new direct tool appears, without either being named here.
  */
-function extractToolNames(files = {}) {
+function extractToolNames(files: Record<string, any> = {}): string[] {
   const names = [];
   const seen = new Set();
   for (const key of Object.keys(files)) {
@@ -1314,7 +1467,7 @@ function extractToolNames(files = {}) {
  * file, with its argument text. Braces are matched by counting, so a nested
  * `execute:` closure does not truncate the block the way a regex would.
  */
-function registrationBlocks(source) {
+function registrationBlocks(source: string): Array<{ body: string; index: number }> {
   const blocks = [];
   const re = /(?:editor|draft)\.add\(/g;
   let m;
@@ -1352,7 +1505,7 @@ function registrationBlocks(source) {
  * prefix identical to the CLI's and marks the dynamic tail so it is not silently
  * missing.
  */
-function extractDynamicDescriptions(files = {}) {
+function extractDynamicDescriptions(files: Record<string, any> = {}): Record<string, DynamicDescriptionSpec> | null {
   const out = {};
   for (const key of Object.keys(files)) {
     if (!key.startsWith("tool:")) continue;
@@ -1372,7 +1525,7 @@ function extractDynamicDescriptions(files = {}) {
   return Object.keys(out).length > 0 ? out : null;
 }
 
-function extractToolOverrides(files = {}) {
+function extractToolOverrides(files: Record<string, any> = {}): ToolOverrides | null {
   for (const key of Object.keys(files)) {
     if (!key.startsWith("tool:")) continue;
     const source = files[key];
@@ -1405,8 +1558,8 @@ function extractToolOverrides(files = {}) {
  * Extract session ID, User-Agent template, headers, and tool schemas from
  * upstream source files.
  */
-function extractRecipe(files = {}) {
-  const out = {};
+function extractRecipe(files: Record<string, any> = {}): RecipeUpdate {
+  const out: RecipeUpdate = {};
 
   const identifier = files.identifier;
   if (typeof identifier === "string") {
@@ -1577,7 +1730,7 @@ function extractRecipe(files = {}) {
   return out;
 }
 
-function buildUserAgent(next = recipe) {
+function buildUserAgent(next: Recipe = recipe): string {
   const tpl = next.userAgentTemplate;
   if (typeof tpl === "string") {
     return tpl
@@ -1588,13 +1741,13 @@ function buildUserAgent(next = recipe) {
   return `opencode/${next.channel}/${next.version}/${next.client}`;
 }
 
-function getUserAgent() {
+function getUserAgent(): string {
   return buildUserAgent(recipe);
 }
 
-function applyRecipe(update = {}, tag = null) {
-  const next = { ...recipe };
-  const changed = [];
+function applyRecipe(update: any = {}, tag: string | null = null): string[] {
+  const next: Recipe = { ...recipe };
+  const changed: string[] = [];
 
   const version = clampString(update.version, 32);
   if (version && /^\d+\.\d+\.\d+$/.test(version) && version !== next.version) {
@@ -1791,7 +1944,8 @@ function applyRecipe(update = {}, tag = null) {
  *                                  when deciding whether to adopt. Used by the
  *                                  periodic CLI-version poll.
  */
-async function refresh({ force = false, recheck = false } = {}) {
+async function refresh(opts: { force?: boolean; recheck?: boolean } = {}): Promise<any> {
+  const { force = false, recheck = false } = opts;
   if (process.env.OPENCODE_USER_AGENT) {
     return { updated: false, reason: "pinned" };
   }
@@ -2045,7 +2199,7 @@ async function refresh({ force = false, recheck = false } = {}) {
  * - In `always` mode: kicks off a background handshake check after TTL expiry.
  * - In `reactive` mode: stays silent after initial check until a gate error occurs.
  */
-function ensureFresh() {
+function ensureFresh(): { updated: boolean; reason: string } {
   if (Date.now() - lastCheckTime < IDENTITY_TTL_MS) {
     return { updated: false, reason: "fresh" };
   }
@@ -2071,7 +2225,7 @@ function ensureFresh() {
  * egress network, and the official CLI gets the same answer from the same IP.
  * Retrying only extends the penalty, so callers must not refresh or replay.
  */
-function isIpAbuseRejection(status, errMsg) {
+function isIpAbuseRejection(status: number, errMsg: any): boolean {
   if (status !== 403) return false;
   const m = String(errMsg || "").toLowerCase();
   return (
@@ -2085,7 +2239,7 @@ function isIpAbuseRejection(status, errMsg) {
  * Reactive self-heal when upstream rejects our request with a CLI gate error
  * (403 FreeTierError or 426 UpgradeRequired).
  */
-async function onGateRejection(status, errType, errMsg, attempted = false) {
+async function onGateRejection(status: number, errType: any, errMsg: any, attempted: boolean = false): Promise<GateRejectionResult> {
   if (attempted) return { retry: false, reason: "already-retried" };
   // A network-level block is terminal: refreshing the recipe cannot change
   // which IP the request leaves from, so skip the GitHub/catalog fetch.
@@ -2144,14 +2298,14 @@ async function onGateRejection(status, errType, errMsg, attempted = false) {
 
 // --- Fast Session ID Generator (Pooled CSPRNG) -------------------------------
 
-let lastTimestamp = 0;
-let counter = 0;
+let lastTimestamp: number = 0;
+let counter: number = 0;
 const MAX_COUNTER_PER_MS = 16;
 const RAND_POOL_SIZE = 14 * 256;
 const randPool = Buffer.allocUnsafe(RAND_POOL_SIZE);
-let randPoolOffset = RAND_POOL_SIZE;
+let randPoolOffset: number = RAND_POOL_SIZE;
 
-function nextRandomChars(chars, count) {
+function nextRandomChars(chars: string, count: number): string {
   if (randPoolOffset + count > RAND_POOL_SIZE) {
     crypto.randomFillSync(randPool);
     randPoolOffset = 0;
@@ -2165,7 +2319,7 @@ function nextRandomChars(chars, count) {
   return out;
 }
 
-function createId(descending = true, timestamp = Date.now()) {
+function createId(descending: boolean = true, timestamp: number = Date.now()): string {
   const {
     sessionCharset: chars,
     sessionLength: length,
@@ -2196,14 +2350,14 @@ function createId(descending = true, timestamp = Date.now()) {
  * The gate's tool-name allowlist, in upstream's own order. Falls back to the
  * tool profile's key order when the source read has not produced a list yet.
  */
-function getToolNames() {
+function getToolNames(): string[] {
   if (toolNames.length > 0) return toolNames.slice();
   return Object.keys(getTools());
 }
 
 /**
  * Current wire endpoints. `chatUrl` / `responsesUrl` are resolved from the
- * upstream provider catalog at refresh time; `server.js` reads these per
+ * upstream provider catalog at refresh time; `server.ts` reads these per
  * request, so an endpoint migration applies without a restart.
  */
 /**
@@ -2211,13 +2365,13 @@ function getToolNames() {
  * catalog has not been read yet — callers keep their own list in that case
  * rather than treating "unknown" as "none are free".
  */
-function getFreeModels() {
+function getFreeModels(): string[] {
   return freeModels.slice();
 }
 
 /** Catalog-derived shorthand: a family name (or a prefix of a free model id)
  *  mapped to a live free model. Returns undefined when nothing matches. */
-function resolveModelAlias(name) {
+function resolveModelAlias(name: any): string | undefined {
   const key = String(name || "").toLowerCase().trim();
   if (!key) return undefined;
   if (modelFamilies[key]) return modelFamilies[key];
@@ -2254,7 +2408,7 @@ function resolveModelAlias(name) {
  * (only the `event.model.id.includes(...)` form upstream uses is supported; an
  * unrecognised condition leaves the list untouched rather than guessing).
  */
-function applyToolOverrides(names, modelId) {
+function applyToolOverrides(names: any, modelId: any): string[] {
   const rule = toolOverrides;
   if (!rule || !Array.isArray(names)) return names.slice();
   const id = String(modelId || "");
@@ -2276,13 +2430,13 @@ function applyToolOverrides(names, modelId) {
 
 /** Catalog facts for one model id: `{ reasoning, maxOutput }`, or undefined
  *  when the catalog does not describe it. */
-function getModelFacts(modelId) {
+function getModelFacts(modelId: any): ModelFacts | undefined {
   return modelFacts[String(modelId || "").toLowerCase()];
 }
 
 /** The catalog's verdict for one model id: "free", "paid", "deprecated", or
  *  undefined when the catalog does not describe it. */
-function getCatalogVerdict(modelId) {
+function getCatalogVerdict(modelId: any): string | undefined {
   return catalogVerdicts[String(modelId || "").toLowerCase()];
 }
 
@@ -2303,9 +2457,9 @@ function getCatalogVerdict(modelId) {
  * its catalog verdict stands rather than guessing a price from its name.
  * Returns the ids whose verdict moved, for logging.
  */
-function applyGatewayPricing(models) {
+function applyGatewayPricing(models: any): string[] {
   if (!Array.isArray(models)) return [];
-  const changed = [];
+  const changed: string[] = [];
   for (const m of models) {
     const id = String(m?.id || "").trim();
     const key = id.toLowerCase();
@@ -2336,7 +2490,7 @@ function applyGatewayPricing(models) {
   return changed;
 }
 
-function getEndpoints(modelId = null) {
+function getEndpoints(modelId: string | null = null): Endpoints {
   const base = {
     chatUrl: recipe.chatUrl,
     responsesUrl: recipe.responsesUrl,
@@ -2356,11 +2510,11 @@ function getEndpoints(modelId = null) {
   return base;
 }
 
-function getRecipe() {
+function getRecipe(): Recipe {
   return { ...recipe };
 }
 
-function getTools() {
+function getTools(): ToolProfile {
   // An empty profile is not a profile. Without this guard `toolProfile || ...`
   // lets `{}` win (objects are truthy) and the bridge sends `tools: []`, which
   // upstream rejects with 403 — the exact failure the fingerprint exists to
@@ -2371,10 +2525,10 @@ function getTools() {
 
 /**
  * The upstream header names currently in force, in upstream's own order.
- * `server.js` builds its header object from this, so a header added upstream
+ * `server.ts` builds its header object from this, so a header added upstream
  * starts being sent on the next request after a refresh.
  */
-function getHeaderNames() {
+function getHeaderNames(): string[] {
   return Array.isArray(recipe.headers) ? recipe.headers.slice() : DEFAULT_RECIPE.headers.slice();
 }
 
@@ -2386,7 +2540,7 @@ function getHeaderNames() {
  * Emitting the heading with no entries is the truthful rendering of "none
  * available" and keeps the static text byte-identical to the CLI's.
  */
-function withDynamicDescription(name, description) {
+function withDynamicDescription(name: string, description: string): string {
   const spec = dynamicDescriptions && dynamicDescriptions[name];
   if (!spec || !Array.isArray(spec.appendPrefix) || spec.appendPrefix.length === 0) return description;
   const joiner = spec.joiner || "\n";
@@ -2398,7 +2552,7 @@ function withDynamicDescription(name, description) {
   return [description, "", ...heading].join(joiner);
 }
 
-function getToolList(flat = false, scope = null, modelId = null) {
+function getToolList(flat: boolean = false, scope: string | null = null, modelId: string | null = null): any[] {
   const profile = getTools();
   const available = Object.keys(profile);
   const mode = scope || process.env.TOOL_PROFILE_SCOPE || "core";
@@ -2457,7 +2611,7 @@ function getToolList(flat = false, scope = null, modelId = null) {
  * being sent empty, because an empty required header is worse than a missing
  * one.
  */
-const GATE_HEADER_VALUES = [
+const GATE_HEADER_VALUES: string[] = [
   "user-agent",
   "x-opencode-client",
   "x-opencode-project",
@@ -2467,7 +2621,7 @@ const GATE_HEADER_VALUES = [
   "x-session-id",
 ];
 
-function buildGateHeaders(ctx = {}) {
+function buildGateHeaders(ctx: GateContext = {}): { headers: Record<string, string>; unsent: string[] } {
   const values = {
     "user-agent": ctx.userAgent,
     "x-opencode-client": ctx.client,
@@ -2504,7 +2658,7 @@ function buildGateHeaders(ctx = {}) {
  * the release source — the alert that a manual mapping is needed, since the
  * request will be sent without it.
  */
-function getUnsentHeaders() {
+function getUnsentHeaders(): string[] {
   const known = new Set(GATE_HEADER_VALUES);
   const conditional = new Set(optionalHeaders.map((n) => String(n).toLowerCase()));
   return getHeaderNames().filter((n) => {
@@ -2516,16 +2670,16 @@ function getUnsentHeaders() {
   });
 }
 
-function getSessionPrefix() {
+function getSessionPrefix(): string {
   return recipe.sessionPrefix || DEFAULT_RECIPE.sessionPrefix;
 }
 
 /** Session id with upstream's prefix, e.g. `ses_<12 hex><14 base62>`. */
-function createSessionId(descending = true, timestamp = Date.now()) {
+function createSessionId(descending: boolean = true, timestamp: number = Date.now()): string {
   return getSessionPrefix() + createId(descending, timestamp);
 }
 
-function getState() {
+function getState(): any {
   return {
     recipe: getRecipe(),
     userAgent: getUserAgent(),
@@ -2559,7 +2713,7 @@ function getState() {
   };
 }
 
-function __reset() {
+function __reset(): void {
   recipe = { ...DEFAULT_RECIPE };
   toolProfile = null;
   toolProfileSource = "default";
@@ -2589,20 +2743,20 @@ function __reset() {
   counter = 0;
 }
 
-function __setLastCheckTime(v) {
+function __setLastCheckTime(v: number): void {
   lastCheckTime = v;
   lastForcedRefreshTime = 0;
   stateEpoch++;
 }
 
 /** Test hook: stage a session prefix without going through recipe validation. */
-function __setSessionPrefix(prefix) {
+function __setSessionPrefix(prefix: any): void {
   recipe = { ...recipe, sessionPrefix: String(prefix) };
   lastForcedRefreshTime = 0;
   stateEpoch++;
 }
 
-function __setToolProfile(tools, source = "test") {
+function __setToolProfile(tools: any, source: string = "test"): void {
   toolProfile = tools;
   toolProfileSource = source;
   toolProfileVersion = recipe.version;
@@ -2642,6 +2796,8 @@ module.exports = {
   sourceRef,
   resolveRelease,
   parseCatalogData,
+  compactCatalog,
+  writeCachedCatalog,
   extractCatalog,
   readCachedSource,
   writeCachedSource,

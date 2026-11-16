@@ -6,7 +6,7 @@ const http = require("node:http");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
-const VERIFY = path.join(__dirname, "..", "verify.js");
+const VERIFY = path.join(__dirname, "..", "verify.ts");
 const INSTALLER = path.join(__dirname, "..", "install.sh");
 
 test("--quick stops at the first success instead of probing every model", () => {
@@ -19,7 +19,7 @@ test("--quick stops at the first success instead of probing every model", () => 
 
 test("--quick uses a shorter per-request timeout", () => {
   const src = fs.readFileSync(VERIFY, "utf8");
-  assert.match(src, /timeoutMs = QUICK \? 25000 : 120000/, "quick mode must not inherit the 120s timeout");
+  assert.match(src, /timeoutMs(?:: number)? = QUICK \? 25000 : 120000/, "quick mode must not inherit the 120s timeout");
 });
 
 test("installer bounds its self-check with a timeout", () => {

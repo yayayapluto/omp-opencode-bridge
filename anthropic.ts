@@ -1,11 +1,14 @@
 "use strict";
 
+// Type-only import: erased at load, no runtime require.
+import type { IncomingMessage, ServerResponse } from "http";
+
 const NEWLINE = String.fromCharCode(10);
 const INTERNAL_HOST = process.env.HOST && process.env.HOST !== "0.0.0.0" ? process.env.HOST : "127.0.0.1";
 const INTERNAL_PORT = parseInt(process.env.PORT || "20129", 10);
 
 // Headers a client may hand us that the bridge's own chat route understands.
-// `user-agent` is deliberately included: server.js re-derives a gate-safe UA
+// `user-agent` is deliberately included: server.ts re-derives a gate-safe UA
 // when the forwarded one is not a valid v2 client string, so passing it through
 // preserves a real CLI's identity and never leaks a bad one upstream.
 const FORWARDED_HEADERS = [
@@ -21,7 +24,98 @@ const FORWARDED_HEADERS = [
   "user-agent",
 ];
 
-function readBody(req, limit) {
+/** One Anthropic content block, as far as this adapter reads it. */
+interface AnthropicBlock {
+  type?: unknown;
+  text?: unknown;
+  id?: unknown;
+  name?: unknown;
+  input?: unknown;
+  content?: unknown;
+  tool_use_id?: unknown;
+}
+
+/** An Anthropic request message. */
+interface AnthropicRequestMessage {
+  role?: unknown;
+  content?: unknown;
+}
+
+/** An Anthropic tool definition. */
+interface AnthropicTool {
+  name?: unknown;
+  description?: unknown;
+  input_schema?: unknown;
+}
+
+/** The Anthropic Messages request body, as far as this adapter reads it. */
+interface AnthropicRequestBody {
+  model?: unknown;
+  messages?: unknown;
+  system?: unknown;
+  max_tokens?: unknown;
+  stream?: unknown;
+  temperature?: unknown;
+  top_p?: unknown;
+  tools?: unknown;
+  tool_choice?: { type?: unknown; name?: unknown } | null;
+  stop_sequences?: unknown;
+  thinking?: unknown;
+  top_k?: unknown;
+  metadata?: unknown;
+  container?: unknown;
+  [key: string]: unknown;
+}
+
+/** The OpenAI-shaped chat completion this adapter consumes. */
+interface OpenAICompletion {
+  model?: unknown;
+  choices?: Array<{
+    finish_reason?: unknown;
+    message?: {
+      content?: unknown;
+      tool_calls?: Array<{ id?: unknown; function?: { name?: unknown; arguments?: unknown } }>;
+    };
+  }>;
+  usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
+}
+
+interface OpenAIToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+interface OpenAIMessage {
+  role: string;
+  content: string;
+  tool_calls?: OpenAIToolCall[];
+}
+
+interface OpenAITool {
+  type: "function";
+  function: { name: string; description: string; parameters: unknown };
+}
+
+/** The Anthropic Messages response this adapter produces. */
+interface AnthropicResponse {
+  id: string;
+  type: "message";
+  role: "assistant";
+  model: string;
+  content: Array<{
+    type: "text" | "tool_use";
+    text?: unknown;
+    id?: string;
+    name?: string;
+    input?: unknown;
+  }>;
+  stop_reason: string;
+  stop_sequence: null;
+  usage: { input_tokens: number; output_tokens: number };
+}
+
+function readBody(req: IncomingMessage, limit?: number): Promise<Buffer> {
   const max = limit || 10 * 1024 * 1024;
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -40,7 +134,7 @@ function readBody(req, limit) {
   });
 }
 
-function systemToString(system) {
+function systemToString(system: unknown): string | undefined {
   if (typeof system === "string") return system;
   if (!Array.isArray(system)) return undefined;
   const text = system
@@ -54,7 +148,7 @@ function systemToString(system) {
  * reported rather than silently dropped: a caller that asked for a thinking
  * budget and received none should be able to see why in the logs.
  */
-function warnUnsupported(body) {
+function warnUnsupported(body: AnthropicRequestBody): void {
   const notes = [];
   if (body && body.thinking) notes.push("thinking");
   if (body && body.top_k !== undefined) notes.push("top_k");
@@ -67,7 +161,7 @@ function warnUnsupported(body) {
   }
 }
 
-function toolsToOpenAI(tools) {
+function toolsToOpenAI(tools: unknown): OpenAITool[] {
   return (Array.isArray(tools) ? tools : [])
     .map((tool) => ({
       type: "function",
@@ -80,8 +174,8 @@ function toolsToOpenAI(tools) {
     .filter((tool) => tool.function.name);
 }
 
-function messagesToOpenAI(messages) {
-  const out = [];
+function messagesToOpenAI(messages: unknown): OpenAIMessage[] {
+  const out: OpenAIMessage[] = [];
   for (const message of Array.isArray(messages) ? messages : []) {
     const role = message && message.role === "assistant" ? "assistant" : "user";
     const blocks = Array.isArray(message && message.content)
@@ -102,7 +196,7 @@ function messagesToOpenAI(messages) {
             arguments: JSON.stringify(b.input || {}),
           },
         }));
-      const item = { role: role, content: text };
+      const item: OpenAIMessage = { role: role, content: text };
       if (toolCalls.length) item.tool_calls = toolCalls;
       out.push(item);
     } else {
@@ -133,11 +227,14 @@ function messagesToOpenAI(messages) {
   return out;
 }
 
-function toOpenAI(body, { stream = false } = {}) {
+function toOpenAI(
+  body: AnthropicRequestBody,
+  { stream = false }: { stream?: boolean } = {}
+): Record<string, unknown> {
   const system = systemToString(body.system);
   const messages = messagesToOpenAI(body.messages);
   if (system) messages.unshift({ role: "system", content: system });
-  const out = {
+  const out: Record<string, unknown> = {
     model: body.model,
     messages: messages,
     max_tokens: body.max_tokens,
@@ -162,11 +259,11 @@ function toOpenAI(body, { stream = false } = {}) {
   return out;
 }
 
-function openAIToAnthropic(completion, requestedModel) {
+function openAIToAnthropic(completion: OpenAICompletion, requestedModel?: string): AnthropicResponse {
   const choice = (completion && completion.choices && completion.choices[0]) || {};
   const message = choice.message || {};
   const usage = (completion && completion.usage) || {};
-  const content = [];
+  const content: AnthropicResponse["content"] = [];
   if (typeof message.content === "string" && message.content) {
     content.push({ type: "text", text: message.content });
   }
@@ -207,14 +304,14 @@ function openAIToAnthropic(completion, requestedModel) {
 }
 
 /** Anthropic's documented mapping for a stop reason, from OpenAI's. */
-function stopReasonOf(finishReason, sawToolUse) {
+function stopReasonOf(finishReason: unknown, sawToolUse: boolean): string {
   if (sawToolUse) return "tool_use";
   if (finishReason === "length") return "max_tokens";
   if (finishReason === "content_filter") return "refusal";
   return "end_turn";
 }
 
-function sseWrite(res, event, payload) {
+function sseWrite(res: ServerResponse, event: string, payload: unknown): void {
   res.write(`event: ${event}${NEWLINE}data: ${JSON.stringify(payload)}${NEWLINE}${NEWLINE}`);
 }
 
@@ -228,8 +325,12 @@ function sseWrite(res, event, payload) {
  * long generation look frozen, so the relay has to forward each delta as it
  * arrives rather than after the last one.
  */
-async function relayStream(res, upstreamBody, requestedModel) {
-  const reader = upstreamBody.getReader();
+async function relayStream(
+  res: ServerResponse,
+  upstreamBody: ReadableStream<Uint8Array> | null,
+  requestedModel: string
+): Promise<void> {
+  const reader = upstreamBody!.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let messageStarted = false;
@@ -379,7 +480,7 @@ async function relayStream(res, upstreamBody, requestedModel) {
   }
 }
 
-function sendSse(res, message) {
+function sendSse(res: ServerResponse, message: AnthropicResponse): void {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
@@ -413,7 +514,7 @@ function sendSse(res, message) {
   res.end();
 }
 
-function errorType(status) {
+function errorType(status: number): string {
   if (status === 400) return "invalid_request_error";
   if (status === 401 || status === 403) return "authentication_error";
   if (status === 404) return "not_found_error";
@@ -423,12 +524,12 @@ function errorType(status) {
   return "api_error";
 }
 
-function sendError(res, status, type, message) {
+function sendError(res: ServerResponse, status: number, type: string, message: string): void {
   res.writeHead(status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
   res.end(JSON.stringify({ type: "error", error: { type: type, message: message } }));
 }
 
-function internalHeaders(req, extra) {
+function internalHeaders(req: IncomingMessage, extra?: Record<string, string>): Record<string, string> {
   const headers = Object.assign({ "Content-Type": "application/json" }, extra || {});
   for (const name of FORWARDED_HEADERS) {
     const value = req.headers[name];
@@ -444,7 +545,7 @@ function internalHeaders(req, extra) {
  * which is the heuristic the Anthropic SDK itself documents as a fallback. A
  * caller using it for budgeting gets a conservative number rather than a 404.
  */
-function estimateInputTokens(body) {
+function estimateInputTokens(body: AnthropicRequestBody): number {
   let chars = 0;
   const system = systemToString(body.system);
   if (system) chars += system.length;
@@ -474,14 +575,14 @@ function estimateInputTokens(body) {
   return Math.max(1, Math.ceil(chars / 4));
 }
 
-async function handleCountTokens(req, res) {
-  let raw;
+async function handleCountTokens(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let raw: Buffer;
   try {
     raw = await readBody(req);
   } catch (e) {
     return sendError(res, 413, "request_too_large", "Payload too large");
   }
-  let body;
+  let body: AnthropicRequestBody;
   try {
     body = JSON.parse(raw.toString("utf8") || "{}");
   } catch (e) {
@@ -494,14 +595,14 @@ async function handleCountTokens(req, res) {
   res.end(JSON.stringify({ input_tokens: estimateInputTokens(body) }));
 }
 
-async function handleAnthropicMessages(req, res) {
-  let raw;
+async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let raw: Buffer;
   try {
     raw = await readBody(req);
   } catch (e) {
     return sendError(res, 413, "request_too_large", "Payload too large");
   }
-  let body;
+  let body: AnthropicRequestBody;
   try {
     body = JSON.parse(raw.toString("utf8") || "{}");
   } catch (e) {

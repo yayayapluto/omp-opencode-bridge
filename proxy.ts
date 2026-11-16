@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * proxy.js: runtime-configurable egress, single proxy or pool.
+ * proxy.ts: runtime-configurable egress, single proxy or pool.
  *
  * Every outbound request this bridge makes (inference, model discovery, identity
  * sync, self-update) can be routed through an HTTP/HTTPS proxy so upstream sees
@@ -45,13 +45,235 @@ const DEFAULT_STRATEGY = "round-robin";
 const DEFAULT_COOLDOWN_MS = 120000;
 const DEFAULT_MAX_COOLDOWN_MS = 1800000;
 
-function stateDir() {
+interface ProxyUrlResult {
+  ok: boolean;
+  url?: string;
+  error?: string;
+}
+
+/** One pool entry as stored in proxy.json (credentials included). */
+interface PoolEntry {
+  id: string;
+  label: string;
+  url: string;
+  direct: boolean;
+  enabled: boolean;
+  weight: number;
+  meter: boolean;
+}
+
+/** Loose shape accepted from config/env before validation. */
+interface PoolEntryInput {
+  id?: unknown;
+  label?: unknown;
+  url?: unknown;
+  direct?: boolean;
+  enabled?: unknown;
+  weight?: unknown;
+  meter?: unknown;
+}
+
+interface PoolEntryResult {
+  ok: boolean;
+  entry?: PoolEntry;
+  error?: string;
+}
+
+interface PoolSpec {
+  entries: PoolEntry[];
+  errors: string[];
+}
+
+/** Payload accepted by `setPool`. */
+interface PoolSpecInput {
+  entries?: unknown[];
+  strategy?: unknown;
+  cooldownMs?: unknown;
+  maxCooldownMs?: unknown;
+}
+
+/** Single-proxy state: the URL in force, where it came from, why it was refused. */
+interface ProxyState {
+  url: string;
+  source: string;
+  error: string | null;
+}
+
+interface PoolState {
+  entries: PoolEntry[];
+  errors: string[];
+  strategy: string;
+  source: string;
+  error: string | null;
+}
+
+interface CooldownConfig {
+  baseMs: number;
+  maxMs: number;
+}
+
+/** Runtime observation for one egress; keyed by `keyOf()`, not by URL alone. */
+interface HealthRecord {
+  failures: number;
+  cooldownUntil: number;
+  lastError: string | null;
+  lastOkAt: number;
+  lastUsedAt: number;
+  lastStatus: string | null;
+}
+
+interface HealthSnapshotRecord {
+  id: string;
+  label: string | null;
+  failures: number;
+  cooldownUntil: number;
+  lastError: string | null;
+  lastStatus: string | null;
+  lastOkAt: number | null;
+  lastUsedAt: number | null;
+  exitIp: string | null;
+}
+
+interface HealthSnapshot {
+  version: number;
+  savedAt: string;
+  entries: HealthSnapshotRecord[];
+}
+
+interface PickOptions {
+  exclude?: string | null;
+  now?: number;
+}
+
+/** The egress chosen for one request. */
+interface PickResult {
+  url: string;
+  id: string | null;
+  label: string | null;
+  source: string;
+  cooling: boolean;
+  cooldownUntil?: number;
+}
+
+interface MarkFailureOptions {
+  reason?: string;
+  now?: number;
+  cooldownMs?: number | null;
+}
+
+interface NowOptions {
+  now?: number;
+}
+
+/** Per-egress traffic accounting for one day. */
+interface UsageRecord {
+  requests: number;
+  okRequests: number;
+  requestBytes: number;
+  responseBytes: number;
+  promptTokens: number;
+  completionTokens: number;
+}
+
+interface UsageState {
+  day: string;
+  perEgress: Record<string, UsageRecord>;
+}
+
+interface UsageView {
+  day: string;
+  perEgress: Record<string, Record<string, unknown>>;
+}
+
+interface EntryDescription {
+  id: string;
+  label: string;
+  host: string | null;
+  enabled: boolean;
+  weight: number;
+  state: string;
+  cooldownMsLeft: number;
+  cooldownUntil: number;
+  failures: number;
+  lastError: string | null;
+  lastOkAt: number | null;
+  lastUsedAt: number | null;
+}
+
+interface PoolDescription {
+  active: boolean;
+  size: number;
+  enabled: number;
+  ready: number;
+  cooling: number;
+  strategy: string;
+  source: string;
+  cooldownMs: number;
+  maxCooldownMs: number;
+  error: string | null;
+  entries: EntryDescription[];
+}
+
+/** Public view handed to the panel and `/health`. */
+interface ProxyDescription {
+  mode: string;
+  proxy: string | null;
+  hasCredentials: boolean;
+  source: string;
+  locked: boolean;
+  configPath: string;
+  error: string | null;
+  pool: PoolDescription;
+}
+
+interface ConfigResult {
+  ok: boolean;
+  error?: string;
+}
+
+/** A setter's verdict: refusal, or the whole new state. */
+type SetResult = ConfigResult & Partial<ProxyDescription>;
+
+/** A fetch init as callers pass it; Bun adds `proxy` for the egress. */
+interface FetchInit {
+  proxy?: string | null;
+  body?: string | Uint8Array | null;
+  headers?: Record<string, string>;
+  signal?: AbortSignal;
+  [key: string]: unknown;
+}
+
+interface ExitIpResult {
+  ip: string | null;
+  error: string | null;
+}
+
+interface ProxyTestOptions {
+  timeoutMs?: number;
+  probeUrl?: string | null;
+}
+
+interface PoolTestOptions {
+  probeUrl?: string | null;
+  timeoutMs?: number;
+}
+
+interface ProxyTestResult {
+  ok: boolean;
+  apiStatus?: number;
+  exitIp?: string | null;
+  latencyMs?: number;
+  error?: string;
+  exitError?: string | null;
+}
+
+function stateDir(): string {
   const raw = process.env.OPENCODE_BRIDGE_STATE_DIR;
   if (raw !== undefined && String(raw).trim()) return String(raw).trim();
   return path.join(os.homedir(), ".opencode-free-bridge");
 }
 
-function configFile() {
+function configFile(): string {
   return path.join(stateDir(), CONFIG_FILE_NAME);
 }
 
@@ -60,7 +282,7 @@ function configFile() {
  * operator intent, health is runtime observation. Writing one must never
  * rewrite the other, and a corrupt health file must not cost the pool.
  */
-function healthFile() {
+function healthFile(): string {
   return path.join(stateDir(), HEALTH_FILE_NAME);
 }
 
@@ -70,7 +292,7 @@ function healthFile() {
  * `""` is valid and means "direct": the panel clears the setting with an empty
  * value rather than a separate verb, so both paths share one validator.
  */
-function parseProxyUrl(raw) {
+function parseProxyUrl(raw: unknown): ProxyUrlResult {
   const value = String(raw === undefined || raw === null ? "" : raw).trim();
   if (!value) return { ok: true, url: "" };
 
@@ -103,7 +325,7 @@ function parseProxyUrl(raw) {
 }
 
 /** `host:port` for display. Credentials are never part of this string. */
-function displayHost(url) {
+function displayHost(url: string | null): string | null {
   if (!url) return null;
   try {
     const u = new URL(url);
@@ -114,7 +336,7 @@ function displayHost(url) {
 }
 
 /** `id` for a URL that has none: stable across reloads, never leaks credentials. */
-function fallbackId(url) {
+function fallbackId(url: string | null): string {
   const host = displayHost(url) || "proxy";
   return host.replace(/[^A-Za-z0-9.:-]/g, "");
 }
@@ -128,8 +350,8 @@ function fallbackId(url) {
  * every proxy is down. That is worth a first-class entry because the host that
  * runs the bridge usually has a usable IP of its own.
  */
-function parsePoolEntry(raw, index) {
-  const source = typeof raw === "string" ? { url: raw } : raw;
+function parsePoolEntry(raw: PoolEntryInput | string, index: number): PoolEntryResult {
+  const source: PoolEntryInput = typeof raw === "string" ? { url: raw } : raw;
   if (!source || typeof source !== "object") {
     return { ok: false, error: `Entri #${index + 1} bukan objek atau URL.` };
   }
@@ -183,7 +405,7 @@ function parsePoolEntry(raw, index) {
  * each optionally prefixed with `label=`. Empty entries are ignored so a
  * trailing separator is not an error.
  */
-function parsePoolSpec(raw) {
+function parsePoolSpec(raw: unknown): PoolSpec {
   const out = [];
   const errors = [];
   String(raw || "")
@@ -206,19 +428,19 @@ function parsePoolSpec(raw) {
 // ---------------------------------------------------------------- state ---
 
 /** Single-proxy state (legacy). `pool` below is used only when it has entries. */
-let current = { url: "", source: "none", error: null };
-let pool = { entries: [], errors: [], strategy: DEFAULT_STRATEGY, source: "none", error: null };
-let cooldowns = { baseMs: DEFAULT_COOLDOWN_MS, maxMs: DEFAULT_MAX_COOLDOWN_MS };
+let current: ProxyState = { url: "", source: "none", error: null };
+let pool: PoolState = { entries: [], errors: [], strategy: DEFAULT_STRATEGY, source: "none", error: null };
+let cooldowns: CooldownConfig = { baseMs: DEFAULT_COOLDOWN_MS, maxMs: DEFAULT_MAX_COOLDOWN_MS };
 
 /**
  * Health is keyed by egress identity, not by proxy URL: the "direct" entry has
  * no URL, and two entries must never share a health record.
  */
-function keyOf(url) {
+function keyOf(url: string | null | undefined): string {
   return url ? url : "@direct";
 }
 /** Usage accounting gate: false skips an entry flagged `meter: false` in config. */
-function shouldMeter(url) {
+function shouldMeter(url: string | null): boolean {
   const entry = url
     ? pool.entries.find((e) => e.url === url)
     : pool.entries.find((e) => e.direct);
@@ -226,10 +448,10 @@ function shouldMeter(url) {
 }
 
 /** key -> { failures, cooldownUntil, lastError, lastOkAt, lastUsedAt } */
-const health = new Map();
-let cursor = 0;
+const health = new Map<string, HealthRecord>();
+let cursor: number = 0;
 
-function healthFor(url) {
+function healthFor(url: string | null): HealthRecord {
   const key = keyOf(url);
   let h = health.get(key);
   if (!h) {
@@ -244,7 +466,7 @@ function healthFor(url) {
  * ghost. Pure: the caller persists, so a reload never writes a half-restored map
  * over a file it has not read yet.
  */
-function pruneHealth(entries) {
+function pruneHealth(entries: PoolEntry[]): number {
   const live = new Set(entries.map((e) => keyOf(e.url)));
   if (current.url) live.add(current.url);
   let removed = 0;
@@ -262,17 +484,17 @@ function pruneHealth(entries) {
  * that already holds proxy credentials; a second copy of every token would be
  * a second thing to leak, and the record only has to be matchable, not readable.
  */
-function healthId(key) {
+function healthId(key: string): string {
   return crypto.createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
-function healthLabel(key) {
+function healthLabel(key: string): string | null {
   if (key === "@direct") return "direct";
   const entry = pool.entries.find((e) => keyOf(e.url) === key);
   return entry ? entry.label : null;
 }
 
-function healthSnapshot(now = Date.now()) {
+function healthSnapshot(now: number = Date.now()): HealthSnapshot {
   return {
     version: HEALTH_VERSION,
     savedAt: new Date(now).toISOString(),
@@ -293,10 +515,15 @@ function healthSnapshot(now = Date.now()) {
   };
 }
 
-let healthWriteTimer = null;
+/** Bun/Node timer handle; only `unref` is read here. */
+interface TimerHandle {
+  unref?: () => void;
+}
+
+let healthWriteTimer: TimerHandle | null = null;
 
 /** Drop the health file: no egress has anything worth remembering. */
-function removeHealthFile() {
+function removeHealthFile(): void {
   try {
     fs.unlinkSync(healthFile());
   } catch (err) {
@@ -312,7 +539,7 @@ function removeHealthFile() {
  * Failure is never surfaced: health is a memory optimization, and a request
  * must not fail because a cache file could not be written.
  */
-function writeHealthNow(now = Date.now()) {
+function writeHealthNow(now: number = Date.now()): void {
   if (healthWriteTimer) {
     clearTimeout(healthWriteTimer);
     healthWriteTimer = null;
@@ -336,7 +563,7 @@ function writeHealthNow(now = Date.now()) {
  * Coalesce rapid writes. A success arrives with every request, and rewriting a
  * file per request would turn a cheap memory update into disk churn.
  */
-function scheduleHealthWrite(delayMs = 1000) {
+function scheduleHealthWrite(delayMs: number = 1000): void {
   if (healthWriteTimer) return;
   healthWriteTimer = setTimeout(() => {
     healthWriteTimer = null;
@@ -354,7 +581,7 @@ function scheduleHealthWrite(delayMs = 1000) {
  * that leaves the map empty, so a live record is by definition at least as
  * fresh as the file.
  */
-function restoreHealth(entries, now = Date.now()) {
+function restoreHealth(entries: PoolEntry[], now: number = Date.now()): number {
   let raw;
   try {
     raw = fs.readFileSync(healthFile(), "utf8");
@@ -411,12 +638,12 @@ function restoreHealth(entries, now = Date.now()) {
   return restored;
 }
 
-function normalizeStrategy(raw) {
+function normalizeStrategy(raw: unknown): string {
   const value = String(raw || "").trim().toLowerCase();
   return STRATEGIES.has(value) ? value : DEFAULT_STRATEGY;
 }
 
-function normalizeCooldowns(raw) {
+function normalizeCooldowns(raw: unknown): CooldownConfig {
   const base = Number(raw?.cooldownMs);
   const max = Number(raw?.maxCooldownMs);
   return {
@@ -425,7 +652,7 @@ function normalizeCooldowns(raw) {
   };
 }
 
-function loadFromDisk() {
+function loadFromDisk(): PoolState {
   const envPool = (process.env[POOL_ENV] || "").trim();
   const envSingle = (process.env[ENV_OVERRIDE] || "").trim();
 
@@ -509,16 +736,16 @@ function loadFromDisk() {
   return pool;
 }
 
-function getProxyUrl() {
+function getProxyUrl(): string {
   return current.url;
 }
 
 /** Enabled entries in config order; the pool's working set. */
-function activeEntries() {
+function activeEntries(): PoolEntry[] {
   return pool.entries.filter((e) => e.enabled);
 }
 
-function isCooling(url, now = Date.now()) {
+function isCooling(url: string | null, now: number = Date.now()): boolean {
   const h = health.get(keyOf(url));
   return Boolean(h && h.cooldownUntil > now);
 }
@@ -533,7 +760,7 @@ function isCooling(url, now = Date.now()) {
  *
  * `exclude` lets a retry avoid the egress that just failed.
  */
-function pick({ exclude = null, now = Date.now() } = {}) {
+function pick({ exclude = null, now = Date.now() }: PickOptions = {}): PickResult {
   const entries = activeEntries();
 
   if (entries.length === 0) {
@@ -617,7 +844,10 @@ function pick({ exclude = null, now = Date.now() } = {}) {
  * is also a reason to move on, but it must not look like a spent allowance, so
  * the caller passes the reason and it is shown separately in the panel.
  */
-function markFailure(egressUrl, { reason = "throttled", now = Date.now(), cooldownMs = null } = {}) {
+function markFailure(
+  egressUrl: string | null,
+  { reason = "throttled", now = Date.now(), cooldownMs = null }: MarkFailureOptions = {}
+): { failures: number; cooldownUntil: number; backoffMs: number } | null {
   // An empty string is the `direct` entry, which is a real egress; only a
   // missing target (null/undefined) means "nothing to record".
   if (egressUrl === null || egressUrl === undefined) return null;
@@ -635,7 +865,7 @@ function markFailure(egressUrl, { reason = "throttled", now = Date.now(), cooldo
 }
 
 /** Clear an egress's failure history; called after a request succeeds. */
-function markSuccess(egressUrl, { now = Date.now() } = {}) {
+function markSuccess(egressUrl: string | null, { now = Date.now() }: NowOptions = {}): HealthRecord | null {
   if (egressUrl === null || egressUrl === undefined) return null;
   const h = healthFor(egressUrl);
   h.failures = 0;
@@ -656,7 +886,7 @@ function markSuccess(egressUrl, { now = Date.now() } = {}) {
  * unreachable) leaves the mapping alone rather than inventing one, and the
  * capped-cooldown path in `loadFromDisk` covers records written without it.
  */
-function noteExitIp(egressUrl, ip, { now = Date.now() } = {}) {
+function noteExitIp(egressUrl: string | null, ip: unknown, { now = Date.now() }: NowOptions = {}): string | null {
   if (egressUrl === null || egressUrl === undefined) return null;
   if (typeof ip !== "string" || !ip) return null;
   const key = keyOf(egressUrl);
@@ -666,14 +896,14 @@ function noteExitIp(egressUrl, ip, { now = Date.now() } = {}) {
   return ip;
 }
 
-function resetHealth() {
+function resetHealth(): void {
   health.clear();
   cursor = 0;
   writeHealthNow();
 }
 
 /** Public view of one entry: host:port, health, and never the URL's credentials. */
-function describeEntry(entry, now = Date.now()) {
+function describeEntry(entry: PoolEntry, now: number = Date.now()): EntryDescription {
   const h = health.get(keyOf(entry.url));
   const cooling = Boolean(h && h.cooldownUntil > now);
   return {
@@ -692,7 +922,7 @@ function describeEntry(entry, now = Date.now()) {
   };
 }
 
-function describe(now = Date.now()) {
+function describe(now: number = Date.now()): ProxyDescription {
   const entries = pool.entries;
   const active = entries.filter((e) => e.enabled);
   const ready = active.filter((e) => !isCooling(e.url, now));
@@ -730,7 +960,7 @@ function describe(now = Date.now()) {
 }
 
 /** Write the whole config atomically-ish: one file, owner-only. */
-function writeConfig(next) {
+function writeConfig(next: Record<string, unknown>): ConfigResult {
   try {
     fs.mkdirSync(path.dirname(configFile()), { recursive: true });
     fs.writeFileSync(configFile(), `${JSON.stringify(next, null, 2)}\n`, {
@@ -747,7 +977,7 @@ function writeConfig(next) {
 }
 
 /** Current on-disk shape, so one setter never drops the other's fields. */
-function readConfigObject() {
+function readConfigObject(): Record<string, unknown> {
   try {
     const json = JSON.parse(fs.readFileSync(configFile(), "utf8"));
     return json && typeof json === "object" ? json : {};
@@ -756,7 +986,7 @@ function readConfigObject() {
   }
 }
 
-function refuseWhenLocked() {
+function refuseWhenLocked(): ConfigResult | null {
   if (pool.source === "env" || current.source === "env") {
     return {
       ok: false,
@@ -773,7 +1003,7 @@ function refuseWhenLocked() {
  * `UPSTREAM_PROXY_URL` is an operator override, so a runtime edit is refused
  * instead of silently losing to the environment on the next restart.
  */
-function setProxyUrl(raw) {
+function setProxyUrl(raw: unknown): SetResult {
   const locked = refuseWhenLocked();
   if (locked) return locked;
   const parsed = parseProxyUrl(raw);
@@ -812,11 +1042,11 @@ function setProxyUrl(raw) {
  *   - `{ entries: [...], strategy, cooldownMs, maxCooldownMs }`
  *   - `[]` / `{ entries: [] }` to clear it and fall back to direct/single egress
  */
-function setPool(raw) {
+function setPool(raw: PoolSpecInput | unknown[] | null | undefined): SetResult {
   const locked = refuseWhenLocked();
   if (locked) return locked;
 
-  const spec = Array.isArray(raw) ? { entries: raw } : raw && typeof raw === "object" ? raw : null;
+  const spec: PoolSpecInput | null = Array.isArray(raw) ? { entries: raw } : raw && typeof raw === "object" ? raw : null;
   if (!spec) return { ok: false, error: "Format pool tidak valid." };
 
   const source = Array.isArray(spec.entries) ? spec.entries : [];
@@ -883,7 +1113,7 @@ function setPool(raw) {
  * An empty target is meaningful: it selects the `direct` pool entry, which is
  * this process's own address, so the fetch goes out without a proxy.
  */
-function withProxy(init, egressUrl = null) {
+function withProxy(init: FetchInit | null | undefined, egressUrl: string | null = null): FetchInit | null | undefined {
   if (init && init.proxy) return init;
   // A caller that pins an egress passes the URL, and "" is the direct entry —
   // distinct from passing nothing, which asks the pool to choose.
@@ -893,7 +1123,7 @@ function withProxy(init, egressUrl = null) {
 }
 
 /** fetch() through the resolved egress. The single egress entry point. */
-function netFetch(url, init, egressUrl = null) {
+function netFetch(url: string, init?: FetchInit, egressUrl: string | null = null): Promise<Response> {
   const metering = shouldMeter(egressUrl);
   const body = init?.body;
   const requestBytes =
@@ -944,17 +1174,17 @@ function netFetch(url, init, egressUrl = null) {
  * token-to-data ratio can be computed from one place.
  */
 const USAGE_FILE_NAME = "usage.json";
-function usageFile() {
+function usageFile(): string {
   return path.join(stateDir(), USAGE_FILE_NAME);
 }
-let usage = {
+let usage: UsageState = {
   // day = UTC date string; rolls when a request lands on a new day.
   day: new Date().toISOString().slice(0, 10),
   perEgress: {}, // key -> { requests, okRequests, requestBytes, responseBytes, promptTokens, completionTokens }
 };
-let usageLoaded = false;
+let usageLoaded: boolean = false;
 
-function usageEntry(key) {
+function usageEntry(key: string): UsageRecord {
   const today = new Date().toISOString().slice(0, 10);
   if (today !== usage.day) {
     usage = { day: today, perEgress: {} };
@@ -973,7 +1203,7 @@ function usageEntry(key) {
   return usage.perEgress[key];
 }
 
-function loadUsage() {
+function loadUsage(): void {
   if (usageLoaded) return;
   usageLoaded = true;
   try {
@@ -984,7 +1214,7 @@ function loadUsage() {
   } catch {}
 }
 
-function persistUsage() {
+function persistUsage(): void {
   try {
     fs.mkdirSync(path.dirname(usageFile()), { recursive: true });
     fs.writeFileSync(usageFile(), `${JSON.stringify(usage, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -992,7 +1222,12 @@ function persistUsage() {
 }
 
 /** Record one wire transaction through an egress. Coarse, by design. */
-function recordUsage(egressUrl, requestBytes, responseBytes, { ok = false, promptTokens = 0, completionTokens = 0 } = {}) {
+function recordUsage(
+  egressUrl: string | null,
+  requestBytes: number,
+  responseBytes: number,
+  { ok = false, promptTokens = 0, completionTokens = 0 } = {}
+): void {
   // Entries flagged `meter: false` in proxy.json stay out of usage.json —
   // the accounting exists for scarce links (phone data), not free ones.
   if (!shouldMeter(egressUrl)) return;
@@ -1012,7 +1247,7 @@ function recordUsage(egressUrl, requestBytes, responseBytes, { ok = false, promp
 }
 
 /** Read view for /health and tests; adds derived MB and token/data ratio. */
-function describeUsage() {
+function describeUsage(): UsageView {
   loadUsage();
   const out = { day: usage.day, perEgress: {} };
   for (const [key, e] of Object.entries(usage.perEgress)) {
@@ -1035,7 +1270,7 @@ function describeUsage() {
  * answers with the exit IP so the panel can show that egress moved. The API
  * probe is the one that decides `ok`; the IP probe is best-effort.
  */
-async function testProxy(url, { timeoutMs = 15000, probeUrl = null } = {}) {
+async function testProxy(url: unknown, { timeoutMs = 15000, probeUrl = null }: ProxyTestOptions = {}): Promise<ProxyTestResult> {
   if (typeof Bun === "undefined") {
     return { ok: false, error: "Proxy egress hanya berjalan di Bun; runtime Node tidak mendukung opsi proxy." };
   }
@@ -1083,7 +1318,7 @@ async function testProxy(url, { timeoutMs = 15000, probeUrl = null } = {}) {
  * health map so the panel's result is also what the next request uses. A
  * throttled entry goes into cooldown; a working one is cleared.
  */
-async function testPool({ probeUrl = null, timeoutMs = 15000 } = {}) {
+async function testPool({ probeUrl = null, timeoutMs = 15000 }: PoolTestOptions = {}): Promise<{ ok: boolean; entries: unknown[] }> {
   const entries = pool.entries.slice();
   if (entries.length === 0) return { ok: true, entries: [] };
   const results = await Promise.all(
@@ -1115,7 +1350,7 @@ async function testPool({ probeUrl = null, timeoutMs = 15000 } = {}) {
   return { ok: results.some((r) => r.ok), entries: results };
 }
 
-async function probeExitIp(proxyUrl, timeoutMs) {
+async function probeExitIp(proxyUrl: string | null, timeoutMs: number): Promise<ExitIpResult> {
   try {
     const res = await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
       proxy: proxyUrl,
@@ -1161,9 +1396,9 @@ const RECOVERY_PROBE_INTERVAL_MS = 60_000;
  * also persisted in the health file so a restart mid-cooldown can still notice
  * the rotation instead of trusting a stale park.
  */
-const exitIpByKey = new Map();
-let recoveryProbeBusy = false;
-async function recoveryProbeTick() {
+const exitIpByKey = new Map<string, string>();
+let recoveryProbeBusy: boolean = false;
+async function recoveryProbeTick(): Promise<void> {
   if (recoveryProbeBusy) return;
   if (pool.strategy !== "priority-failover" || pool.entries.length === 0) return;
   recoveryProbeBusy = true;
@@ -1258,7 +1493,7 @@ module.exports = {
   get strategy() {
     return pool.strategy;
   },
-  __setForTest(state) {
+  __setForTest(state: ProxyState) {
     current = state;
   },
   __reload: loadFromDisk,

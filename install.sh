@@ -10,8 +10,8 @@
 #   2. downloads the bridge into a staging directory and validates it before
 #      touching anything that is already running
 #   3. retires a pre-2.0 `opencode-bridge.service` that would fight for the port
-#   4. copies the bridge and its tools into an install dir (server.js,
-#      identity.js, token-budget.js, verify.js, gate-drill.js and the
+#   4. copies the bridge and its tools into an install dir (server.ts,
+#      identity.ts, token-budget.ts, verify.ts, gate-drill.ts and the
 #      transport-fingerprint files), backing up any existing install first
 #   5. registers a service so the bridge starts on boot and restarts on crash
 #      (systemd on Linux, launchd on macOS). Windows is not supported.
@@ -145,7 +145,7 @@ fi
 # Upgrading from 1.x or early 2.x means three things change underneath:
 #
 #   * the runtime (node -> bun), so any service unit still says `node`
-#   * the file set (identity.js and the transport tools are new), so a partial
+#   * the file set (identity.ts and the transport tools are new), so a partial
 #     copy from an older installer leaves a bridge that cannot start
 #   * the transport itself, so an old install that "worked" now needs Bun to
 #     get anything but 403
@@ -160,11 +160,11 @@ if [ -n "$PREV_VERSION" ]; then
   say "Found existing install: v$PREV_VERSION in $BINDIR"
   BACKUP="$BINDIR/.backup-v$PREV_VERSION-$(date +%Y%m%d%H%M%S)"
   mkdir -p "$BACKUP"
-  for f in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json package.json tunnel-doctor.sh proxy.js panel.js egress-proxy.js THIRD_PARTY_NOTICES.md; do
+  for f in server.ts identity.ts token-budget.ts verify.ts gate-drill.ts transport-fingerprint.ts transport-baseline.json package.json tunnel-doctor.sh proxy.ts panel.ts egress-proxy.ts anthropic.ts THIRD_PARTY_NOTICES.md; do
     [ -f "$BINDIR/$f" ] && cp -p "$BINDIR/$f" "$BACKUP/$f" 2>/dev/null || true
   done
   say "Backed up to $BACKUP"
-  if [ -f "$BINDIR/server.js" ] && ! grep -q '#!/usr/bin/env bun' "$BINDIR/server.js" 2>/dev/null; then
+  if [ -f "$BINDIR/server.ts" ] && ! grep -q '#!/usr/bin/env bun' "$BINDIR/server.ts" 2>/dev/null; then
     say "Old install ran on Node; this version requires Bun for the live gate"
   fi
 fi
@@ -179,8 +179,8 @@ migrate_service_runtime() {
               "$HOME/.config/systemd/user/opencode-free-bridge.service"; do
     [ -f "$unit" ] || continue
     if grep -q 'ExecStart=.*node' "$unit" 2>/dev/null; then
-      sed -i.bak -E "s|^ExecStart=.*|ExecStart=\"$esc_runtime\" \"$esc_bindir/server.js\"|" "$unit" 2>/dev/null || {
-        warn "could not rewrite $unit — update ExecStart to: \"$RUNTIME\" \"$BINDIR/server.js\""
+      sed -i.bak -E "s|^ExecStart=.*|ExecStart=\"$esc_runtime\" \"$esc_bindir/server.ts\"|" "$unit" 2>/dev/null || {
+        warn "could not rewrite $unit — update ExecStart to: \"$RUNTIME\" \"$BINDIR/server.ts\""
         continue
       }
       say "Service unit updated to run under $(basename "$RUNTIME"): $unit"
@@ -247,7 +247,7 @@ port_held_by_own_bridge() {
   pid="$(pid_on_port)"
   [ -n "$pid" ] || return 1
 
-  # The detached bridge is started with `bun server.js` after a pushd, so its
+  # The detached bridge is started with `bun server.ts` after a pushd, so its
   # cmdline is relative and only the cwd identifies it. readlink appends
   # " (deleted)" once the install directory has been replaced, which must not
   # defeat the match.
@@ -255,8 +255,8 @@ port_held_by_own_bridge() {
   target="$(readlink -f "$BINDIR" 2>/dev/null || printf '%s' "$BINDIR")"
   [ -n "$cwd" ] && [ -n "$target" ] && [ "$cwd" = "$target" ] && return 0
 
-  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$BINDIR/server.js" && return 0
-  ps -p "$pid" -o command= 2>/dev/null | grep -qF "$BINDIR/server.js" && return 0
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$BINDIR/server.ts" && return 0
+  ps -p "$pid" -o command= 2>/dev/null | grep -qF "$BINDIR/server.ts" && return 0
   command -v lsof >/dev/null 2>&1 && lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | grep -qF "n$target" && return 0
   return 1
 }
@@ -345,7 +345,7 @@ RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 SOURCE="${SOURCE:-auto}"
 SRC_DIR=""
 if [ "$SOURCE" = "auto" ]; then
-  if [ -f "$SCRIPT_DIR/server.js" ] && [ -f "$SCRIPT_DIR/package.json" ]; then
+  if [ -f "$SCRIPT_DIR/server.ts" ] && [ -f "$SCRIPT_DIR/package.json" ]; then
     SOURCE="local"
   else
     SOURCE="remote"
@@ -376,7 +376,7 @@ fetch() {
   fi
   # raw.githubusercontent.com sits behind a CDN that can serve the previous
   # commit for a while after a push. A stale install.sh is harmless (it already
-  # ran) but a stale server.js next to a fresh identity.js is not. The query
+  # ran) but a stale server.ts next to a fresh identity.ts is not. The query
   # string is ignored by the server and defeats the cache.
   local url="$RAW/$file?cb=$(date +%s)"
   if command -v curl >/dev/null 2>&1; then
@@ -395,33 +395,39 @@ fetch() {
 
 
 fetch package.json
-fetch server.js
-fetch identity.js
-fetch token-budget.js
-fetch verify.js
-fetch gate-drill.js
-fetch transport-fingerprint.js
+fetch server.ts
+fetch identity.ts
+fetch token-budget.ts
+fetch verify.ts
+fetch gate-drill.ts
+fetch transport-fingerprint.ts
 fetch transport-baseline.json
 fetch tunnel-doctor.sh
-fetch proxy.js
-fetch panel.js
+fetch proxy.ts
+fetch panel.ts
+fetch egress-proxy.ts
+fetch anthropic.ts
 
 # A syntactically broken release must never replace a working install.
 #
 # `bun --check` does NOT mean "parse only": Bun has no --check flag, so it
 # treats the file as the entrypoint and *runs* it. That started a second server
 # during an install and, worse, made every upgrade abort with "failed a syntax
-# check". Parse the source instead: new Function compiles without executing.
+# check". Parse the source instead: Bun.Transpiler compiles TypeScript without
+# executing it, and `new Function` remains the fallback on a Node runtime.
 syntax_check() {
   "$RUNTIME" -e '
     const fs = require("fs");
     const src = fs.readFileSync(process.argv[1], "utf8").replace(/^#!.*\n/, "");
-    try { new Function(src); } catch (err) { console.error(err.message); process.exit(1); }
+    try {
+      if (typeof Bun !== "undefined" && Bun.Transpiler) new Bun.Transpiler({ loader: "ts" }).transformSync(src);
+      else new Function(src);
+    } catch (err) { console.error(err.message); process.exit(1); }
   ' "$1"
 }
 
-for js in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js proxy.js panel.js; do
-  syntax_check "$STAGE/$js" >/dev/null 2>&1 || die "$js failed a syntax check; the running bridge was left untouched"
+for ts in server.ts identity.ts token-budget.ts verify.ts gate-drill.ts transport-fingerprint.ts proxy.ts panel.ts egress-proxy.ts anthropic.ts; do
+  syntax_check "$STAGE/$ts" >/dev/null 2>&1 || die "$ts failed a syntax check; the running bridge was left untouched"
 done
 for json in package.json transport-baseline.json; do
   "$RUNTIME" -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$STAGE/$json" \
@@ -451,10 +457,10 @@ if [ -n "$(port_holder)" ]; then
   die "cannot bind port $PORT"
 fi
 
-for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json tunnel-doctor.sh proxy.js panel.js egress-proxy.js THIRD_PARTY_NOTICES.md; do
+for file in package.json server.ts identity.ts token-budget.ts verify.ts gate-drill.ts transport-fingerprint.ts transport-baseline.json tunnel-doctor.sh proxy.ts panel.ts egress-proxy.ts anthropic.ts THIRD_PARTY_NOTICES.md; do
   [ -f "$STAGE/$file" ] && mv -f "$STAGE/$file" "$BINDIR/$file"
 done
-chmod +x "$BINDIR/server.js" "$BINDIR/identity.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" "$BINDIR/transport-fingerprint.js" "$BINDIR/tunnel-doctor.sh" "$BINDIR/egress-proxy.js" 2>/dev/null || true
+chmod +x "$BINDIR/server.ts" "$BINDIR/identity.ts" "$BINDIR/verify.ts" "$BINDIR/gate-drill.ts" "$BINDIR/transport-fingerprint.ts" "$BINDIR/tunnel-doctor.sh" "$BINDIR/egress-proxy.ts" 2>/dev/null || true
 say "Files installed (v$("$RUNTIME" -e 'try{process.stdout.write(require(process.argv[1]).version||"latest")}catch{process.stdout.write("latest")}' "$BINDIR/package.json" 2>/dev/null || echo 'latest'))"
 
 # ---------------------------------------------------------------- service ---
@@ -479,7 +485,7 @@ User=$(id -un)
 WorkingDirectory=$BINDIR
 Environment=PORT=$PORT
 Environment=HOST=$HOST
-ExecStart="$RUNTIME" "$BINDIR/server.js"
+ExecStart="$RUNTIME" "$BINDIR/server.ts"
 Restart=always
 RestartSec=3
 MemoryMax=512M
@@ -510,7 +516,7 @@ Type=simple
 WorkingDirectory=$BINDIR
 Environment=PORT=$PORT
 Environment=HOST=$HOST
-ExecStart="$RUNTIME" "$BINDIR/server.js"
+ExecStart="$RUNTIME" "$BINDIR/server.ts"
 Restart=always
 RestartSec=3
 MemoryMax=512M
@@ -543,7 +549,7 @@ UNIT
 <dict>
   <key>Label</key><string>com.opencode-free-bridge</string>
   <key>ProgramArguments</key>
-  <array><string>$RUNTIME</string><string>$BINDIR/server.js</string></array>
+  <array><string>$RUNTIME</string><string>$BINDIR/server.ts</string></array>
   <key>WorkingDirectory</key><string>$BINDIR</string>
   <key>EnvironmentVariables</key>
   <dict><key>PORT</key><string>$PORT</string><key>HOST</key><string>$HOST</string></dict>
@@ -562,7 +568,7 @@ PLIST
     return 0
   fi
 
-  warn "no supported service manager found — start it manually: PORT=$PORT $RUNTIME $BINDIR/server.js"
+  warn "no supported service manager found — start it manually: PORT=$PORT $RUNTIME $BINDIR/server.ts"
   return 1
 }
 
@@ -576,7 +582,7 @@ fi
 # ------------------------------------------------------------ start check ---
 if [ "$SERVICE_OK" != "1" ]; then
   say "Starting in the background (no service manager)"
-  pkill -f -- "$BINDIR/server.js" 2>/dev/null || true
+  pkill -f -- "$BINDIR/server.ts" 2>/dev/null || true
   sleep 0.5
   # Two things matter here, and both were measured:
   #
@@ -589,9 +595,9 @@ if [ "$SERVICE_OK" != "1" ]; then
   # pushd/popd changes directory without forking. Measured: 0.004s.
   pushd "$BINDIR" >/dev/null
   if command -v setsid >/dev/null 2>&1; then
-    setsid env PORT="$PORT" HOST="$HOST" "$RUNTIME" server.js </dev/null >"$BINDIR/bridge.log" 2>&1 &
+    setsid env PORT="$PORT" HOST="$HOST" "$RUNTIME" server.ts </dev/null >"$BINDIR/bridge.log" 2>&1 &
   else
-    env PORT="$PORT" HOST="$HOST" nohup "$RUNTIME" server.js </dev/null >"$BINDIR/bridge.log" 2>&1 &
+    env PORT="$PORT" HOST="$HOST" nohup "$RUNTIME" server.ts </dev/null >"$BINDIR/bridge.log" 2>&1 &
   fi
   disown 2>/dev/null || true
   popd >/dev/null
@@ -635,19 +641,19 @@ fi
 say "Bridge is answering on http://$PROBE_HOST:$PORT"
 
 echo
-say "Running self-check (quick — full check: $RUNTIME $BINDIR/verify.js)"
+say "Running self-check (quick — full check: $RUNTIME $BINDIR/verify.ts)"
 echo
 # Bounded on purpose: the self-check talks to a live upstream that can throttle.
 # Without a hard cap, a slow upstream makes the installer look hung, and the user
 # kills it before the service is registered.
 if command -v timeout >/dev/null 2>&1; then
   set +e
-  PORT="$PORT" HOST="$HOST" timeout 120 "$RUNTIME" "$BINDIR/verify.js" --quick
+  PORT="$PORT" HOST="$HOST" timeout 120 "$RUNTIME" "$BINDIR/verify.ts" --quick
   CHECK_RC=$?
   set -e
 else
   set +e
-  PORT="$PORT" HOST="$HOST" "$RUNTIME" "$BINDIR/verify.js" --quick
+  PORT="$PORT" HOST="$HOST" "$RUNTIME" "$BINDIR/verify.ts" --quick
   CHECK_RC=$?
   set -e
 fi
@@ -663,15 +669,15 @@ esac
 # The TLS fingerprint is the gate. An outdated Bun installs and starts happily
 # and then earns a 403 that looks exactly like an exhausted IP allowance, so
 # check it here rather than letting the user debug the wrong thing.
-if [ -f "$BINDIR/transport-fingerprint.js" ] && [ -f "$BINDIR/transport-baseline.json" ]; then
+if [ -f "$BINDIR/transport-fingerprint.ts" ] && [ -f "$BINDIR/transport-baseline.json" ]; then
   set +e
-  ( cd "$BINDIR" && "$RUNTIME" transport-fingerprint.js --check >/dev/null 2>&1 )
+  ( cd "$BINDIR" && "$RUNTIME" transport-fingerprint.ts --check >/dev/null 2>&1 )
   TLS_RC=$?
   set -e
   if [ "$TLS_RC" != "0" ]; then
     warn "this Bun build's TLS ClientHello does not match the recorded OpenCode CLI baseline"
     warn "upstream inspects that fingerprint; expect 403 until it matches."
-    warn "inspect: cd $BINDIR && $RUNTIME transport-fingerprint.js --check"
+    warn "inspect: cd $BINDIR && $RUNTIME transport-fingerprint.ts --check"
   fi
 fi
 
@@ -686,7 +692,7 @@ cat <<NEXT
   Add it to 9Router, Cursor, Continue, or any OpenAI-compatible client as a
   custom provider. Re-run the self-check any time with:
 
-      "$RUNTIME" $BINDIR/verify.js
+      "$RUNTIME" $BINDIR/verify.ts
 
 NEXT
 

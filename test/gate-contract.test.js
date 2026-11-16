@@ -17,7 +17,7 @@
  *
  * Measurements (2026-10-18, byte-identical requests replayed from a refused
  * egress and a clean one, one field varied at a time) are recorded next to
- * GATE_ANCHOR_TOOL_NAMES / GATE_ANCHOR_HEADER_NAMES in identity.js.
+ * GATE_ANCHOR_TOOL_NAMES / GATE_ANCHOR_HEADER_NAMES in identity.ts.
  */
 const { describe, it, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
@@ -154,14 +154,14 @@ describe("gate contract: the header anchors", () => {
   it("never emits a User-Agent the gate refuses", () => {
     // Measured refusals: absent, bare `opencode`, `Mozilla/5.0 …`, `curl/8.18.0`.
     const { headers } = identity.buildGateHeaders({ ...ctx, userAgent: "curl/8.18.0" });
-    // identity.js passes values through; server.js owns UA validation. Assert
-    // the validator here so a caller that bypasses server.js is still covered.
+    // identity.ts passes values through; server.ts owns UA validation. Assert
+    // the validator here so a caller that bypasses server.ts is still covered.
     assert.equal(srv.isValidV2UserAgent("curl/8.18.0"), false);
     assert.equal(srv.isValidV2UserAgent("Mozilla/5.0 (X11; Linux x86_64)"), false);
     assert.equal(srv.isValidV2UserAgent("opencode"), false);
     assert.equal(srv.isValidV2UserAgent("opencode/9.9.9"), false, "needs the full 3-segment shape");
     assert.equal(srv.isValidV2UserAgent("opencode/latest/2.0.32/cli"), true);
-    assert.equal(srv.isValidV2UserAgent("OpenCode/2.0.32"), false, "identity.js uses the 4-segment form");
+    assert.equal(srv.isValidV2UserAgent("OpenCode/2.0.32"), false, "identity.ts uses the 4-segment form");
   });
 
   it("replaces an operator override the gate would refuse", () => {

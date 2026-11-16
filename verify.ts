@@ -1,11 +1,11 @@
 #!/usr/bin/env bun
 /**
- * verify.js — self-check for opencode-free-bridge.
+ * verify.ts — self-check for opencode-free-bridge.
  *
  * Answers the only question a new user has: "does this actually work?"
  *
- *   bun verify.js          full check: every discovered model, real prompt
- *   bun verify.js --quick  one probe per model, faster
+ *   bun verify.ts          full check: every discovered model, real prompt
+ *   bun verify.ts --quick  one probe per model, faster
  *
  * Exit code is 0 when at least one model answers, 1 otherwise, so it can be
  * wired into CI or a post-install step.
@@ -32,6 +32,69 @@ const ok = (s) => `${C.green}${s}${C.reset}`;
 const warn = (s) => `${C.yellow}${s}${C.reset}`;
 const bad = (s) => `${C.red}${s}${C.reset}`;
 
+/** One probe's verdict for a model. */
+interface ProbeResult {
+  state: "ok" | "ratelimited" | "gate-closed" | "upgrade-required" | "thinking-only" | "empty" | "failed";
+  ms: number;
+  detail?: string;
+  chars?: number;
+  outTokens?: number;
+}
+
+/** Where the bridge dials upstream, as /health reports it. */
+interface EgressInfo {
+  mode?: string;
+  proxy?: { proxy?: string };
+  relay?: string;
+}
+
+/** The /health fields this check reads. */
+interface HealthResult {
+  ok: boolean;
+  detail?: string;
+  version?: string;
+  runtime?: string | null;
+  models?: number;
+  egress?: EgressInfo | null;
+}
+
+/** Token usage as the bridge reports it. */
+interface Usage {
+  completion_tokens?: number;
+}
+
+/** One completion, SSE chunk, or error envelope — only the fields read here. */
+interface CompletionBody {
+  choices?: Array<{
+    message?: { role?: string; content?: string; reasoning_content?: string };
+    delta?: { content?: string; reasoning_content?: string };
+    finish_reason?: string | null;
+  }>;
+  usage?: Usage | null;
+  error?: { message?: string };
+  data?: Array<{ id?: string }>;
+  version?: string;
+  runtime?: string;
+  discoveredModels?: number;
+  egress?: EgressInfo;
+}
+
+/** The TLS fingerprint fields the drift check compares and prints. */
+interface Fingerprint {
+  runtime?: string;
+  ciphers?: unknown;
+  extensions?: unknown;
+}
+
+/** Raw HTTP result; `error` is set only when the request never completed. */
+interface ProbeHttpResponse {
+  status: number;
+  headers?: Record<string, string | string[] | undefined>;
+  body?: CompletionBody | null;
+  raw?: string;
+  error?: string;
+}
+
 /**
  * Fold an SSE stream from the bridge into one Chat Completions object.
  *
@@ -39,16 +102,16 @@ const bad = (s) => `${C.red}${s}${C.reset}`;
  * (content plus reasoning_content) and `usage`. Tool-call deltas are not needed
  * by a readiness probe, so they are ignored rather than reconstructed.
  */
-function assembleSse(raw) {
+function assembleSse(raw: string): CompletionBody {
   let content = "";
   let reasoning = "";
-  let finish = null;
-  let usage = null;
+  let finish: string | null = null;
+  let usage: Usage | null = null;
   for (const line of raw.split("\n")) {
     if (!line.startsWith("data:")) continue;
     const chunk = line.slice(5).trim();
     if (!chunk || chunk === "[DONE]") continue;
-    let ev = null;
+    let ev: CompletionBody | null = null;
     try { ev = JSON.parse(chunk); } catch { continue; }
     // The bridge forwards an in-stream failure as an SSE error event.
     if (ev?.error) return { error: ev.error };
@@ -64,7 +127,7 @@ function assembleSse(raw) {
   };
 }
 
-function request(method, path, body, timeoutMs = QUICK ? 25000 : 120000) {
+function request(method: string, path: string, body: unknown, timeoutMs: number = QUICK ? 25000 : 120000): Promise<ProbeHttpResponse> {
   return new Promise((resolve) => {
     const payload = body ? JSON.stringify(body) : null;
     const req = http.request(
@@ -81,7 +144,7 @@ function request(method, path, body, timeoutMs = QUICK ? 25000 : 120000) {
         let data = "";
         res.on("data", (c) => (data += c));
         res.on("end", () => {
-          let parsed = null;
+          let parsed: CompletionBody | null = null;
           try { parsed = JSON.parse(data); } catch { /* non-JSON body */ }
           // The bridge always streams upstream, so a `stream: true` probe comes
           // back as SSE. Fold it into the same shape a non-streaming call would
@@ -99,10 +162,10 @@ function request(method, path, body, timeoutMs = QUICK ? 25000 : 120000) {
 }
 
 // A reasoning model needs room to think before it answers. This mirrors the
-// floor token-budget.js enforces, so the check exercises the real path.
+// floor token-budget.ts enforces, so the check exercises the real path.
 const PROBE_MAX_TOKENS = QUICK ? 50 : 2000;
 
-async function checkHealth() {
+async function checkHealth(): Promise<HealthResult> {
   const res = await request("GET", "/health", null, 10000);
   if (res.status !== 200 || !res.body) {
     return { ok: false, detail: res.error || `HTTP ${res.status}` };
@@ -116,13 +179,13 @@ async function checkHealth() {
   };
 }
 
-async function listModels() {
+async function listModels(): Promise<string[]> {
   const res = await request("GET", "/v1/models", null, 15000);
   if (res.status !== 200 || !res.body?.data) return [];
   return res.body.data.map((m) => m.id);
 }
 
-async function probe(model) {
+async function probe(model: string): Promise<ProbeResult> {
   const started = Date.now();
   // `stream: true` is not cosmetic. Measured from one IP, one process, one
   // header set: an upstream request without `stream` is refused with 403
@@ -182,14 +245,14 @@ async function probe(model) {
   return { state: "ok", ms, chars: content.length, outTokens: res.body?.usage?.completion_tokens };
 }
 
-(async () => {
+(async (): Promise<void> => {
   console.log(`\n${C.bold}opencode-free-bridge — self check${C.reset}`);
   console.log(`${C.dim}${BASE}${C.reset}\n`);
 
   const health = await checkHealth();
   if (!health.ok) {
     console.log(`  ${bad("FAIL")} bridge not reachable: ${health.detail}`);
-    console.log(`\n  Start it first:  ${C.cyan}bun server.js${C.reset}`);
+    console.log(`\n  Start it first:  ${C.cyan}bun server.ts${C.reset}`);
     console.log(`  Or install it:   ${C.cyan}bash install.sh${C.reset}\n`);
     process.exit(1);
   }
@@ -223,7 +286,7 @@ async function probe(model) {
       QUICK ? " (quick — stops at the first success)" : ""
     }...\n`
   );
-  const results = [];
+  const results: Array<ProbeResult & { model: string }> = [];
   for (const model of toProbe) {
     const r = await probe(model);
     results.push({ model, ...r });
@@ -250,7 +313,7 @@ async function probe(model) {
     if (r.state === "ratelimited") break;
   }
 
-  const counts = results.reduce((acc, r) => ((acc[r.state] = (acc[r.state] || 0) + 1), acc), {});
+  const counts: Record<string, number> = results.reduce((acc: Record<string, number>, r) => ((acc[r.state] = (acc[r.state] || 0) + 1), acc), {});
   const usable = counts.ok || 0;
   const blocked = (counts["gate-closed"] || 0) + (counts.ratelimited || 0);
   const broken = (counts["thinking-only"] || 0) + (counts.empty || 0) + (counts.failed || 0) + (counts["upgrade-required"] || 0);
@@ -268,11 +331,11 @@ async function probe(model) {
       if (typeof health.runtime === "string" && health.runtime.startsWith("node/")) {
         console.log(`\n  ${bad("Server is running on Node.js, not Bun.")}`);
         console.log(`  ${C.dim}The bridge reported runtime ${health.runtime}. Upstream rejects Node's TLS ClientHello with 403 FreeTierError.${C.reset}`);
-        console.log(`  ${C.dim}Restart the bridge with Bun: ${C.reset}${C.cyan}bun server.js${C.reset}\n`);
+        console.log(`  ${C.dim}Restart the bridge with Bun: ${C.reset}${C.cyan}bun server.ts${C.reset}\n`);
         process.exit(1);
       }
       if (process.versions.bun) {
-        let tlsDrift = null;
+        let tlsDrift: { now: Fingerprint; base: Fingerprint } | null = null;
         try {
           const fs = require("fs");
           const path = require("path");
@@ -289,7 +352,7 @@ async function probe(model) {
         if (tlsDrift) {
           console.log(`\n  ${bad("TLS fingerprint drift detected.")}`);
           console.log(`  ${C.dim}This Bun runtime (${tlsDrift.now.runtime}) does not match the recorded OpenCode CLI baseline (${tlsDrift.base.runtime}).${C.reset}`);
-          console.log(`  ${C.dim}Inspect: ${C.reset}${C.cyan}bun transport-fingerprint.js --check${C.reset}\n`);
+          console.log(`  ${C.dim}Inspect: ${C.reset}${C.cyan}bun transport-fingerprint.ts --check${C.reset}\n`);
           process.exit(1);
         }
       }
@@ -301,7 +364,7 @@ async function probe(model) {
     console.log(`  ${C.dim}The official OpenCode CLI gets the same answer from this network right now.${C.reset}`);
     console.log(`  ${C.dim}If the message names abusive traffic, the network is flagged: email help@anoma.ly; only upstream can clear it.${C.reset}`);
     console.log(`  ${C.dim}Otherwise wait for the allowance window to reset, or run the bridge on another host.${C.reset}`);
-    console.log(`  ${C.dim}Re-check later: ${C.reset}${C.cyan}bun verify.js --quick${C.reset}\n`);
+    console.log(`  ${C.dim}Re-check later: ${C.reset}${C.cyan}bun verify.ts --quick${C.reset}\n`);
     process.exit(2);
   }
 

@@ -1,42 +1,44 @@
 {
   "name": "opencode-free-bridge",
-  "version": "2.4.0",
-  "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required), self-adapting to gate changes",
-  "main": "server.js",
+  "version": "2.6.0",
+  "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required), self-adapting to gate changes; also an OMP/pi plugin",
+  "main": "server.ts",
   "bin": {
-    "opencode-free-bridge": "server.js"
+    "opencode-free-bridge": "server.ts"
   },
   "scripts": {
-    "start": "bun server.js",
+    "start": "bun server.ts",
     "test": "bun test test/*.test.js",
-    "drill": "bun gate-drill.js",
-    "verify": "bun verify.js",
-    "verify:quick": "bun verify.js --quick",
-    "fingerprint": "bun transport-fingerprint.js",
-    "fingerprint:check": "bun transport-fingerprint.js --check",
-    "start:node": "node server.js",
+    "drill": "bun gate-drill.ts",
+    "verify": "bun verify.ts",
+    "verify:quick": "bun verify.ts --quick",
+    "fingerprint": "bun transport-fingerprint.ts",
+    "fingerprint:check": "bun transport-fingerprint.ts --check",
+    "start:node": "node server.ts",
     "test:node": "node --test test/*.test.js",
-    "drill:node": "node gate-drill.js"
+    "drill:node": "node gate-drill.ts"
   },
   "engines": {
     "bun": ">=1.0.0"
   },
   "files": [
-    "server.js",
-    "identity.js",
-    "token-budget.js",
-    "verify.js",
-    "gate-drill.js",
+    "server.ts",
+    "identity.ts",
+    "token-budget.ts",
+    "verify.ts",
+    "gate-drill.ts",
     "README.md",
     "AGENTS.md",
     "install.sh",
     "THIRD_PARTY_NOTICES.md",
-    "egress-proxy.js",
-    "transport-fingerprint.js",
+    "egress-proxy.ts",
+    "transport-fingerprint.ts",
     "transport-baseline.json",
     "tunnel-doctor.sh",
-    "proxy.js",
-    "panel.js"
+    "proxy.ts",
+    "panel.ts",
+    "anthropic.ts",
+    "src"
   ],
   "keywords": [
     "opencode",
@@ -48,7 +50,32 @@
     "9router",
     "cursor",
     "continue",
-    "vscode"
+    "vscode",
+    "pi-package",
+    "pi-extension",
+    "omp",
+    "coding-agent"
   ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/azrinaldi/opencode-free-bridge.git"
+  },
+  "homepage": "https://github.com/azrinaldi/opencode-free-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/azrinaldi/opencode-free-bridge/issues"
+  },
   "license": "MIT"
 }

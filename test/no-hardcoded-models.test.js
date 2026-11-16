@@ -5,8 +5,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const ROOT = path.join(__dirname, "..");
-const SERVER = path.join(ROOT, "server.js");
-const IDENTITY = path.join(ROOT, "identity.js");
+const SERVER = path.join(ROOT, "server.ts");
+const IDENTITY = path.join(ROOT, "identity.ts");
 
 test("no hardcoded model-name table exists in the shipped code", () => {
   // Regression: MODEL_MAP was a 17-entry table of shorthands ("pickle" ->
@@ -40,8 +40,8 @@ test("offline start still resolves aliases from the cache", () => {
   );
 });
 
-test("token-budget.js contains no hardcoded model-name hints", () => {
-  const tb = fs.readFileSync(path.join(ROOT, "token-budget.js"), "utf8");
+test("token-budget.ts contains no hardcoded model-name hints", () => {
+  const tb = fs.readFileSync(path.join(ROOT, "token-budget.ts"), "utf8");
   const { REASONING_MODEL_HINTS } = require("../token-budget");
   assert.deepEqual(REASONING_MODEL_HINTS, []);
   assert.doesNotMatch(tb, /"cat-jam"|"pickle"/, "retired/conversational model hints must not return");

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * panel.js: the browser panel served at `/`.
+ * panel.ts: the browser panel served at `/`.
  *
  * One job: let the operator point the bridge's egress at an HTTP proxy and see
  * whether that proxy actually reaches upstream. Everything the panel draws comes
@@ -418,7 +418,24 @@ $("pool-clear").addEventListener("click", async () => {
 load();
 `;
 
-function escapeHtml(value) {
+interface PanelOptions {
+  version?: string | number;
+  port?: string | number;
+}
+
+/** Shape of `proxy.describe()`; only the scalar fields are read here. */
+interface PanelDescription {
+  mode?: string;
+  proxy?: string | null;
+  hasCredentials?: boolean;
+  source?: string;
+  locked?: boolean;
+  configPath?: string;
+  error?: string | null;
+  pool?: Record<string, unknown>;
+}
+
+function escapeHtml(value: unknown): string {
   return String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 }
 
@@ -427,8 +444,8 @@ function escapeHtml(value) {
  * fields are read, and they are escaped, so a value from the config file cannot
  * become markup.
  */
-function renderPanel(description, { version = "", port = "" } = {}) {
-  const state = description || {};
+function renderPanel(description?: PanelDescription | null, { version = "", port = "" }: PanelOptions = {}): string {
+  const state: PanelDescription = description || {};
   return `<!doctype html>
 <html lang="id">
 <head>

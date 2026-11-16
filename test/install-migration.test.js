@@ -33,12 +33,12 @@ test("installer fetches every file the runtime needs", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");
   for (const f of [
-    "server.js",
-    "identity.js",
-    "token-budget.js",
-    "verify.js",
-    "gate-drill.js",
-    "transport-fingerprint.js",
+    "server.ts",
+    "identity.ts",
+    "token-budget.ts",
+    "verify.ts",
+    "gate-drill.ts",
+    "transport-fingerprint.ts",
     "transport-baseline.json",
   ]) {
     assert.match(src, new RegExp(`fetch ${f.replace(".", "\\.")}`), `installer does not fetch ${f}`);
@@ -94,13 +94,13 @@ test("installer writes a systemd unit systemd actually accepts", () => {
   assert.match(src, /if ! systemctl restart opencode-free-bridge/);
 });
 
-test("verify.js separates an IP throttle from a broken bridge", () => {
-  const src = fs.readFileSync(path.join(__dirname, "..", "verify.js"), "utf8");
+test("verify.ts separates an IP throttle from a broken bridge", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "verify.ts"), "utf8");
   // A 403 FreeTierError is upstream refusing the network, not a bridge fault.
   // Reporting it as FAIL made a correct install look broken on a throttled VPS.
-  assert.match(src, /gate-closed/, "verify.js must have a distinct gate-closed state");
-  assert.match(src, /process\.exit\(2\)/, "verify.js must exit 2 when only the IP is refused");
-  assert.match(src, /free tier can only be used/i, "verify.js must recognise the upstream refusal body");
+  assert.match(src, /gate-closed/, "verify.ts must have a distinct gate-closed state");
+  assert.match(src, /process\.exit\(2\)/, "verify.ts must exit 2 when only the IP is refused");
+  assert.match(src, /free tier can only be used/i, "verify.ts must recognise the upstream refusal body");
 });
 
 test("installer reports the self-check outcome instead of always claiming a timeout", () => {
@@ -164,7 +164,7 @@ test("installer checks the TLS fingerprint before declaring success", () => {
   const src = fs.readFileSync(INSTALLER, "utf8");
   // An outdated Bun installs and runs, then earns a 403 that looks exactly
   // like an exhausted IP allowance. The installer must say so.
-  assert.match(src, /transport-fingerprint\.js --check/);
+  assert.match(src, /transport-fingerprint\.ts --check/);
   assert.match(src, /does not match the recorded OpenCode CLI baseline/);
 });
 
@@ -220,7 +220,7 @@ test("server refuses to start on Node without ALLOW_NODE", () => {
   }
   if (!nodeBin) return; // no Node on this machine; nothing to assert
 
-  const server = path.join(__dirname, "..", "server.js");
+  const server = path.join(__dirname, "..", "server.ts");
   const env = { ...process.env, PORT: "0" };
   delete env.ALLOW_NODE;
   let code = 0;
@@ -242,11 +242,12 @@ test("server refuses to start on Node without ALLOW_NODE", () => {
   assert.match(stderr, /0\/6[\s\S]*6\/6/, "the message must cite the measurement");
 });
 
-test("self-updater in server.js parses JS and JSON in-process instead of spawning bun --check", async () => {
-  const serverPath = path.join(__dirname, "..", "server.js");
+test("self-updater in server.ts parses TS and JSON in-process instead of spawning bun --check", async () => {
+  const serverPath = path.join(__dirname, "..", "server.ts");
   const src = fs.readFileSync(serverPath, "utf8");
-  assert.doesNotMatch(src, /\["--check"/, "server.js must not invoke --check on Bun");
-  assert.match(src, /new Function\(text\.replace\(\/\^#!\.\*\\n\/, ""\)\)/);
+  assert.doesNotMatch(src, /\["--check"/, "server.ts must not invoke --check on Bun");
+  assert.match(src, /Bun\.Transpiler/, "downloaded .ts must be syntax-checked in-process");
+  assert.match(src, /new Function\(src\)/, "the Node fallback must still compile plain JS");
 
   const srv = require("../server");
   const origFetch = global.fetch;
@@ -263,7 +264,7 @@ test("self-updater in server.js parses JS and JSON in-process instead of spawnin
           text: async () => JSON.stringify({ name: "opencode-free-bridge", version: "99.0.0" }),
         };
       }
-      if (u.includes("identity.js")) {
+      if (u.includes("identity.ts")) {
         return {
           ok: true,
           text: async () => "const broken = {{{ syntax error;",
@@ -273,7 +274,7 @@ test("self-updater in server.js parses JS and JSON in-process instead of spawnin
     };
     const res = await srv.checkAndApplyUpdate();
     assert.equal(res.updated, false);
-    assert.match(res.error, /syntax check failed for identity\.js/);
+    assert.match(res.error, /syntax check failed for identity\.ts/);
   } finally {
     global.fetch = origFetch;
     if (prevAuto === undefined) delete process.env.AUTO_UPDATE;
@@ -285,17 +286,21 @@ test("self-updater in server.js parses JS and JSON in-process instead of spawnin
 test("every shipped file reaches installed hosts through both delivery paths", () => {
   const root = path.join(__dirname, "..");
   const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
-  const serverSrc = fs.readFileSync(path.join(root, "server.js"), "utf8");
+  const serverSrc = fs.readFileSync(path.join(root, "server.ts"), "utf8");
   const installSrc = fs.readFileSync(path.join(root, "install.sh"), "utf8");
 
   const updateBlock = serverSrc.match(/const UPDATE_FILES = \[([\s\S]*?)\];/);
-  assert.ok(updateBlock, "server.js has no UPDATE_FILES list");
+  assert.ok(updateBlock, "server.ts has no UPDATE_FILES list");
   const updateFiles = [...updateBlock[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
 
   // These are the runtime files an installed bridge needs. A file that is in
   // package.json but in neither delivery path ships to nobody, which is how
   // tunnel-doctor.sh was committed yet missing from every host in the fleet.
-  const runtime = pkg.files.filter((f) => f !== "README.md" && f !== "AGENTS.md" && f !== "install.sh");
+  // `src/index.ts` is the OMP/pi extension: npm delivers it to the plugin host,
+  // and the bridge never loads it.
+  const runtime = pkg.files.filter(
+    (f) => f !== "README.md" && f !== "AGENTS.md" && f !== "install.sh" && f !== "src"
+  );
   for (const f of runtime) {
     assert.ok(updateFiles.includes(f), `${f} is in package.json files but not in UPDATE_FILES`);
     assert.ok(installSrc.includes(f), `${f} is in package.json files but install.sh never fetches it`);
@@ -313,7 +318,7 @@ test("installer installs the local checkout instead of 404ing on unpushed files"
   const src = fs.readFileSync(INSTALLER, "utf8");
   // Running install.sh from a clone means installing that working tree. It used
   // to always download from GitHub, so a file that existed only locally failed
-  // with a bare `curl: (22) ... 404` after the release list gained proxy.js.
+  // with a bare `curl: (22) ... 404` after the release list gained proxy.ts.
   assert.match(src, /SOURCE="\$\{SOURCE:-auto\}"/);
   assert.match(src, /cp -p "\$SRC_DIR\/\$file"/, "local source must copy the checkout file");
   assert.match(src, /Source: local checkout/, "the installer must say where files came from");
@@ -324,54 +329,54 @@ test("installer installs the local checkout instead of 404ing on unpushed files"
   assert.match(src, /probe_health/);
 });
 
-test("verify.js checks runtime and TLS baseline before blaming the IP for a closed gate", () => {
-  const src = fs.readFileSync(path.join(__dirname, "..", "verify.js"), "utf8");
+test("verify.ts checks runtime and TLS baseline before blaming the IP for a closed gate", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "verify.ts"), "utf8");
   assert.match(src, /health\.runtime\.startsWith\("node\/"\)/);
   assert.match(src, /TLS fingerprint drift detected/);
 });
 
-test("a server.js that requires a module the old updater never fetched still boots", async () => {
-  // 2.1.0's UPDATE_FILES had no proxy.js/panel.js. Updating that install to
-  // 2.2.0 therefore wrote a server.js whose top-level requires pointed at files
+test("a server.ts that requires a module the old updater never fetched still boots", async () => {
+  // 2.1.0's UPDATE_FILES had no proxy.ts/panel.ts. Updating that install to
+  // 2.2.0 therefore wrote a server.ts whose top-level requires pointed at files
   // the updater never downloaded, and the restart crash-looped with
   // "Cannot find module './proxy'". Reproduced here against a temp tree: the
   // module loader must degrade to direct egress, not throw.
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ofb-missing-module-"));
-  const serverPath = path.join(tmp, "server.js");
+  const serverPath = path.join(tmp, "server.ts");
   try {
     // Every real sibling module, except the two the 2.1.0 updater did not know
     // about. `token-budget` is a hard require and must stay, or this would test
     // a different failure.
     for (const f of fs.readdirSync(path.join(__dirname, ".."))) {
-      if (!f.endsWith(".js") || f === "proxy.js" || f === "panel.js") continue;
+      if (!f.endsWith(".ts") || f === "proxy.ts" || f === "panel.ts") continue;
       fs.copyFileSync(path.join(__dirname, "..", f), path.join(tmp, f));
     }
     fs.copyFileSync(path.join(__dirname, "..", "package.json"), path.join(tmp, "package.json"));
-    assert.equal(fs.existsSync(path.join(tmp, "proxy.js")), false);
-    // `proxy.js` and `panel.js` are deliberately absent from this directory.
+    assert.equal(fs.existsSync(path.join(tmp, "proxy.ts")), false);
+    // `proxy.ts` and `panel.ts` are deliberately absent from this directory.
     const out = execFileSync(
       process.execPath,
       ["-e", `const m = require(${JSON.stringify(serverPath)}); console.log(typeof m.__repairMissingModules)`],
       { encoding: "utf8", env: { ...process.env, ALLOW_NODE: "1" } }
     );
-    assert.match(out, /function/, "server.js must load without proxy.js/panel.js");
+    assert.match(out, /function/, "server.ts must load without proxy.ts/panel.ts");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
 
-test("the updater stages every local module the incoming server.js requires", () => {
-  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  // The guard must read the *incoming* server.js and fetch its imports, so an
+test("the updater stages every local module the incoming server.ts requires", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.ts"), "utf8");
+  // The guard must read the *incoming* server.ts and fetch its imports, so an
   // old file list cannot install a server it cannot boot.
-  assert.match(src, /localRequires\(fs\.readFileSync\(incoming\.tmpPath/, "updater does not inspect the incoming server.js");
+  assert.match(src, /localRequires\(fs\.readFileSync\(incoming\.tmpPath/, "updater does not inspect the incoming server.ts");
   assert.match(src, /Staged newly required module/, "updater never logs a staged dependency");
   // And boot repairs a tree that is already missing modules.
   assert.match(src, /repairMissingModules\(\)/, "boot never repairs missing modules");
 });
 
 test("the panel API refuses cross-site and non-JSON writes", () => {
-  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.ts"), "utf8");
   assert.match(src, /function adminRequestError/, "no admin request guard");
   assert.match(src, /sec-fetch-site/, "guard ignores Sec-Fetch-Site");
   assert.match(src, /type !== "application\/json"/, "guard accepts non-JSON bodies (CSRF)");

@@ -16,17 +16,18 @@ jobs:
       - name: Unit tests (Bun)
         run: bun test test/*.test.js
       - name: Offline drills (Bun)
-        run: bun gate-drill.js
+        run: bun gate-drill.ts
       - name: Transport fingerprint matches the CLI baseline
-        run: bun transport-fingerprint.js --check
+        run: bun transport-fingerprint.ts --check
 
-  # The bridge still runs on Node, but Node is refused by the live gate, so it is
-  # tested for compatibility only — never as the supported runtime.
+  # The bridge still runs on Node (type stripping), but Node is refused by the
+  # live gate, so it is tested for compatibility only — never as the supported
+  # runtime. TypeScript requires Node >= 23.6 (type stripping by default).
   compat:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [18.x, 20.x, 22.x]
+        node-version: [24.x]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

@@ -452,7 +452,7 @@ describe("server unit & integration tests", () => {
         };
       };
       // Reasoning status comes from the catalog (`modelFacts`), not a
-      // substring list in token-budget.js.
+      // substring list in token-budget.ts.
       identity.applyRecipe({
         modelFacts: { "cat-jam-free": { reasoning: true, maxOutput: 131072 } },
       });

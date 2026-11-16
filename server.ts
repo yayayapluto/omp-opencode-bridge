@@ -26,21 +26,236 @@ try {
 } catch {}
 const { effectiveMaxTokens } = require("./token-budget");
 const { handleAnthropicMessages, handleCountTokens } = require("./anthropic");
+// TypeScript type declarations only — erased at load. `proxy` and `panel` are
+// required dynamically, so their API is described here rather than imported.
+declare const Bun: {
+  version: string;
+  Transpiler?: new (options: { loader: string }) => { transformSync(source: string): string };
+};
+
+/** The node:http request surface this file uses. */
+interface IncomingRequestLike {
+  method?: string;
+  url?: string;
+  headers: Record<string, string | string[] | undefined>;
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+  once(event: string, listener: (...args: unknown[]) => void): unknown;
+  off?(event: string, listener: (...args: unknown[]) => void): unknown;
+  removeListener?(event: string, listener: (...args: unknown[]) => void): unknown;
+  pause?(): void;
+  destroy?(): void;
+  [key: string]: unknown;
+}
+
+/** The node:http response surface this file uses. */
+interface ServerResponseLike {
+  headersSent: boolean;
+  writableEnded: boolean;
+  writeHead(status: number, headers?: Record<string, string | number>): unknown;
+  setHeader(name: string, value: string | number): unknown;
+  write(chunk: string): unknown;
+  end(chunk?: unknown): unknown;
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+  once(event: string, listener: (...args: unknown[]) => void): unknown;
+  off(event: string, listener: (...args: unknown[]) => void): unknown;
+  destroy(): void;
+  [key: string]: unknown;
+}
+
+/** A `fetch` response, as `proxy.netFetch` returns one. */
+interface FetchHeaders {
+  get(name: string): string | null;
+}
+
+interface StreamReader {
+  read(): Promise<{ done: boolean; value?: Uint8Array }>;
+  cancel(): Promise<unknown>;
+}
+
+interface FetchResponse {
+  ok: boolean;
+  status: number;
+  headers: FetchHeaders;
+  text(): Promise<string>;
+  json(): Promise<unknown>;
+  body: { getReader(): StreamReader };
+}
+
+/** One pool entry as `proxy.pick()` returns it. */
+interface EgressChoice {
+  url: string | null;
+  cooling?: boolean;
+}
+
+/** A recorded egress failure, as `proxy.markFailure` takes it. */
+interface EgressFailure {
+  reason?: string;
+  cooldownMs?: number | null;
+}
+
+/** One entry of the egress pool, as `proxy.describe().pool` reports it. */
+interface ProxyPool {
+  active: boolean;
+  enabled: number;
+  size: number;
+  strategy: string;
+  cooldownMs: number;
+}
+
+/** The egress block `proxy.describe()` returns. */
+interface ProxyState {
+  mode: string;
+  proxy: string | null;
+  pool?: ProxyPool;
+  [key: string]: unknown;
+}
+
+/** Egress-proxy API this server calls. `proxy.ts` implements it; PROXY_FALLBACK stubs it. */
+interface ProxyApi {
+  getProxyUrl(): string;
+  withProxy(init: unknown): unknown;
+  netFetch(url: string, init?: unknown, egressUrl?: string | null): Promise<FetchResponse>;
+  describe(): ProxyState;
+  setProxyUrl(url: string): ProxySetResult;
+  testProxy(url: string, options?: { probeUrl?: string }): Promise<ProxyTestResult>;
+  setPool?: (spec: unknown) => ProxyPoolResult;
+  parsePoolEntry?: (entry: unknown, index: number) => ParsedPoolEntry;
+  displayHost?: (url: string | null) => string;
+  pick?: (options?: { exclude?: string | null }) => EgressChoice;
+  markFailure?: (url: string | null, info?: EgressFailure) => void;
+  markSuccess?: (url: string | null) => void;
+  describeUsage?: () => unknown;
+  recoveryProbeTick?: () => Promise<unknown>;
+}
+
+/** Result of changing the single-proxy setting. */
+interface ProxySetResult {
+  ok: boolean;
+  error?: string;
+  mode?: string;
+  proxy?: string;
+}
+
+/** Result of installing an egress pool. */
+interface ProxyPoolResult {
+  ok: boolean;
+  error?: string;
+  pool: ProxyPool;
+}
+
+/** Result of probing one candidate proxy. */
+interface ProxyTestResult {
+  ok: boolean;
+  apiStatus?: number | null;
+  exitIp?: string | null;
+  latencyMs?: number | null;
+  error?: string | null;
+  [key: string]: unknown;
+}
+
+/** One parsed pool entry, as `proxy.parsePoolEntry` returns it. */
+interface ParsedPoolEntry {
+  ok: boolean;
+  error?: string;
+  entry: { id: string; label: string; url: string };
+}
+
+/** One entry in the persistent upstream-session cache. */
+interface SessionCacheEntry {
+  sessionId: string;
+  lastSeen: number;
+}
+
+/** What the outgoing request actually carried, used to tell a shape bug from an IP block. */
+interface GateShape {
+  hasReadTool: boolean;
+  toolCount: number;
+  userAgentOk: boolean;
+  userAgent: string;
+  sessionHeaders: string[];
+}
+
+/** The last gate rejection, as reported by /health. */
+interface GateDiagnostic {
+  at: number;
+  kind: "free-tier-gate" | "ip-abuse";
+  status: number;
+  logId: string | null;
+  message?: string;
+  shape?: GateShape;
+  shapeOk?: boolean;
+  missing?: string[];
+  model: string;
+}
+
+/** The last upstream 5xx, as reported by /health. */
+interface UpstreamErrorRecord {
+  at: number;
+  status: number;
+  logId: string | null;
+  cfRay: string | null;
+  cfPlacement: string | null;
+  message: string;
+  model: string;
+}
+
+/** The egress one client request is pinned to, and how it has fared. */
+interface EgressState {
+  egress: EgressChoice;
+  egressUrl: string | null;
+  transportFailures: number;
+}
+
+/** Wire endpoints resolved for one request. */
+interface Endpoints {
+  responsesUrl: string;
+  chatUrl: string;
+  modelsUrl: string;
+}
+
+/** Upstream request body for the chosen protocol lane, plus the tool alias map. */
+interface UpstreamPayload {
+  upstreamBody: Record<string, unknown>;
+  aliasToOriginal: Map<string, string>;
+}
+
+/** Result of merging the client's tools with the fingerprint tools. */
+interface ToolFingerprintResult {
+  tools: unknown[];
+  appended: string[];
+  placeholderNote: string;
+  aliasToOriginal: Map<string, string>;
+  originalToAlias: Map<string, string>;
+}
+
+/** Outcome of one self-update attempt. */
+interface UpdateResult {
+  updated: boolean;
+  reason?: string;
+  version?: string;
+  error?: string;
+}
+
+/** Files a boot-time repair downloaded, and files it could not. */
+interface RepairResult {
+  repaired: string[];
+  failed: string[];
+}
 
 /**
  * Load a sibling module, or a fallback when the file is not on disk yet.
  *
  * This exists because of a real upgrade path: 2.1.0's self-updater had no
- * `proxy.js`/`panel.js` in its file list, so updating that install to 2.2.0
- * wrote a `server.js` that required modules the updater never fetched. A hard
+ * `proxy.ts`/`panel.ts` in its file list, so updating that install to 2.2.0
+ * wrote a `server.ts` that required modules the updater never fetched. A hard
  * `require` turned that into a crash loop (`Cannot find module './proxy'`)
  * after the restart, with no way back except reinstalling. A missing optional
  * module must degrade to direct egress, never prevent the process from booting.
  *
- * Only a missing *own* module is tolerated. If `proxy.js` exists but requires
+ * Only a missing *own* module is tolerated. If `proxy.ts` exists but requires
  * something absent, that is a broken install and the error must surface.
  */
-function loadLocalModule(name, fallback) {
+function loadLocalModule(name: string, fallback: unknown): unknown {
   try {
     return require(`./${name}`);
   } catch (err) {
@@ -49,10 +264,10 @@ function loadLocalModule(name, fallback) {
   }
 }
 
-const PROXY_FALLBACK = {
+const PROXY_FALLBACK: ProxyApi = {
   getProxyUrl: () => "",
-  withProxy: (init) => init,
-  netFetch: (url, init) => fetch(url, init),
+  withProxy: (init: unknown) => init,
+  netFetch: (url: string, init?: unknown) => fetch(url, init),
   describe: () => ({
     mode: "direct",
     proxy: null,
@@ -69,6 +284,11 @@ const PROXY_FALLBACK = {
   testProxy: async () => ({ ok: false, error: "proxy.js belum terpasang." }),
 };
 
+/** The panel renderer this server calls; `panel.ts` implements it. */
+interface PanelApi {
+  renderPanel(state: ProxyState, meta: { version: string; port: number }): string;
+}
+
 const PANEL_FALLBACK = {
   renderPanel: () =>
     "<!doctype html><meta charset=\"utf-8\"><title>opencode-free-bridge</title>" +
@@ -81,18 +301,18 @@ const PANEL_FALLBACK = {
 
 // Egress proxy and the panel that configures it. Loaded before anything else
 // touches the network so the first request already honours a saved proxy.
-let proxy = loadLocalModule("proxy", PROXY_FALLBACK);
-let panel = loadLocalModule("panel", PANEL_FALLBACK);
+let proxy = loadLocalModule("proxy", PROXY_FALLBACK) as ProxyApi;
+let panel = loadLocalModule("panel", PANEL_FALLBACK) as PanelApi;
 
 /**
  * Local modules this server requires by relative path. The self-updater uses
- * this to refuse an update that would install a `server.js` whose imports are
+ * this to refuse an update that would install a `server.ts` whose imports are
  * not part of the release, and boot uses it to repair a half-installed tree.
  */
-function localRequires(source) {
+function localRequires(source: unknown): string[] {
   const names = new Set();
   // Strip comments first: the doc comment above names `require("./x")` as an
-  // example, and scanning it produced a bogus `x.js` dependency.
+  // example, and scanning it produced a bogus `x.ts` dependency.
   const text = String(source || "")
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
@@ -102,7 +322,7 @@ function localRequires(source) {
     let match;
     while ((match = re.exec(text))) {
       if (match[1].endsWith(".json")) continue;
-      const name = match[1].endsWith(".js") ? match[1] : `${match[1]}.js`;
+      const name = match[1].endsWith(".ts") ? match[1] : `${match[1]}.ts`;
       names.add(name);
     }
   }
@@ -110,19 +330,19 @@ function localRequires(source) {
 }
 
 /**
- * Fetch files that `server.js` requires but that are not on disk.
+ * Fetch files that `server.ts` requires but that are not on disk.
  *
- * 2.1.0 shipped a self-updater whose file list predated `proxy.js`/`panel.js`,
+ * 2.1.0 shipped a self-updater whose file list predated `proxy.ts`/`panel.ts`,
  * so an update to 2.2.0 wrote a server that could not boot. That install now
  * starts with the fallbacks above; this repairs it on the next boot instead of
  * leaving the panel permanently unavailable. Best-effort: a failure keeps the
  * fallback, never blocks startup.
  */
-async function repairMissingModules(dir = __dirname) {
+async function repairMissingModules(dir: string = __dirname): Promise<RepairResult> {
   const fs = require("fs");
   const path = require("path");
-  const required = new Set(localRequires(fs.readFileSync(path.join(dir, "server.js"), "utf8")));
-  for (const name of ["proxy.js", "panel.js"]) required.add(name);
+  const required = new Set(localRequires(fs.readFileSync(path.join(dir, "server.ts"), "utf8")));
+  for (const name of ["proxy.ts", "panel.ts"]) required.add(name);
   const missing = [...required].filter((f) => !fs.existsSync(path.join(dir, f)));
   const repaired = [];
   const failed = [];
@@ -135,7 +355,8 @@ async function repairMissingModules(dir = __dirname) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const text = await res.text();
       if (!text || text.length < 20) throw new Error("empty response");
-      new Function(text.replace(/^#!.*\n/, ""));
+      const syntax = moduleSyntaxError(text);
+      if (syntax) throw new Error(syntax);
       const tmp = path.join(dir, `.${file}.repair.${process.pid}`);
       fs.writeFileSync(tmp, text, "utf8");
       fs.renameSync(tmp, path.join(dir, file));
@@ -145,8 +366,8 @@ async function repairMissingModules(dir = __dirname) {
     }
   }
   if (repaired.length && path.resolve(dir) === path.resolve(__dirname)) {
-    proxy = loadLocalModule("proxy", PROXY_FALLBACK);
-    panel = loadLocalModule("panel", PANEL_FALLBACK);
+    proxy = loadLocalModule("proxy", PROXY_FALLBACK) as ProxyApi;
+    panel = loadLocalModule("panel", PANEL_FALLBACK) as PanelApi;
     console.log(`[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
   } else if (repaired.length) {
     console.log(`[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
@@ -181,7 +402,7 @@ const UPSTREAM_RELAY_URL = (process.env.UPSTREAM_RELAY_URL || "").trim();
  * credentials or a token in the query string; those must not be handed to any
  * client that can reach the local health endpoint.
  */
-function relayLabel(url) {
+function relayLabel(url: string): string {
   try {
     return new URL(url).origin;
   } catch {
@@ -189,7 +410,7 @@ function relayLabel(url) {
   }
 }
 
-// Wire endpoints. These are *defaults*; the live values come from identity.js,
+// Wire endpoints. These are *defaults*; the live values come from identity.ts,
 // which resolves them from the upstream provider catalog (`opencode.api` in
 // models.opencode.ai/api.json) at refresh time. Reading them per request means
 // a /zen/v1 → /inference/v1 style migration applies without a restart.
@@ -214,28 +435,28 @@ const UPDATE_BASE_URL =
 const AUTO_UPDATE = process.env.AUTO_UPDATE !== "0" && process.env.AUTO_UPDATE !== "false";
 const UPDATE_FILES = [
   "package.json",
-  "identity.js",
-  "token-budget.js",
-  "verify.js",
-  "gate-drill.js",
-  "transport-fingerprint.js",
+  "identity.ts",
+  "token-budget.ts",
+  "verify.ts",
+  "gate-drill.ts",
+  "transport-fingerprint.ts",
   "transport-baseline.json",
   "tunnel-doctor.sh",
-  "proxy.js",
-  "panel.js",
-  "egress-proxy.js",
-  "anthropic.js",
-  "server.js",
+  "proxy.ts",
+  "panel.ts",
+  "egress-proxy.ts",
+  "anthropic.ts",
+  "server.ts",
   "THIRD_PARTY_NOTICES.md",
 ];
-let updateInFlight = null;
+let updateInFlight: Promise<UpdateResult> | null = null;
 let lastUpdateCheck = 0;
 const UPDATE_CHECK_TTL_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Compare two `x.y.z` versions. Returns true when `remote` is newer.
  */
-function isNewerVersion(current, remote) {
+function isNewerVersion(current: unknown, remote: unknown): boolean {
   const a = String(current).split(".").map(Number);
   const b = String(remote).split(".").map(Number);
   for (let i = 0; i < 3; i++) {
@@ -244,6 +465,19 @@ function isNewerVersion(current, remote) {
     if (bv !== av) return bv > av;
   }
   return false;
+}
+
+/** Parse a downloaded module without executing it. TS needs Bun's transpiler;
+ *  `new Function` only understands the JS subset it strips to. */
+function moduleSyntaxError(text: string): string | null {
+  const src = String(text).replace(/^#!.*\n/, "");
+  try {
+    if (typeof Bun !== "undefined" && Bun.Transpiler) new Bun.Transpiler({ loader: "ts" }).transformSync(src);
+    else new Function(src);
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
 }
 
 /**
@@ -255,7 +489,7 @@ function isNewerVersion(current, remote) {
  * Deliberately *not* on the request path: it runs alongside model discovery,
  * at most once per UPDATE_CHECK_TTL_MS.
  */
-async function checkAndApplyUpdate() {
+async function checkAndApplyUpdate(): Promise<UpdateResult> {
   if (!AUTO_UPDATE) return { updated: false, reason: "disabled" };
   if (updateInFlight) return updateInFlight;
   if (Date.now() - lastUpdateCheck < UPDATE_CHECK_TTL_MS) {
@@ -296,12 +530,9 @@ async function checkAndApplyUpdate() {
         if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${file}`);
         const text = await res.text();
         if (!text || text.length < 20) throw new Error(`empty response for ${file}`);
-        if (file.endsWith(".js")) {
-          try {
-            new Function(text.replace(/^#!.*\n/, ""));
-          } catch (err) {
-            throw new Error(`syntax check failed for ${file}: ${err.message}`);
-          }
+        if (file.endsWith(".ts")) {
+          const syntax = moduleSyntaxError(text);
+          if (syntax) throw new Error("syntax check failed for " + file + ": " + syntax);
         } else if (file.endsWith(".json")) {
           try {
             JSON.parse(text);
@@ -339,12 +570,12 @@ async function checkAndApplyUpdate() {
       }
 
       // A release can add a module that an older `UPDATE_FILES` list does not
-      // name. 2.1.0 -> 2.2.0 did exactly that: the new server.js required
+      // name. 2.1.0 -> 2.2.0 did exactly that: the new server.ts required
       // ./proxy and ./panel, the old updater never fetched them, and the
-      // restart crash-looped. Read the *incoming* server.js and stage every
+      // restart crash-looped. Read the *incoming* server.ts and stage every
       // local module it imports, so the file list in the running process can
       // never be the reason a valid release fails to boot.
-      const incoming = tmpFiles.find((f) => path.basename(f.targetPath) === "server.js");
+      const incoming = tmpFiles.find((f) => path.basename(f.targetPath) === "server.ts");
       if (incoming) {
         const declared = new Set(tmpFiles.map((f) => path.basename(f.targetPath)));
         for (const file of localRequires(fs.readFileSync(incoming.tmpPath, "utf8"))) {
@@ -356,11 +587,8 @@ async function checkAndApplyUpdate() {
           if (!res.ok) throw new Error(`HTTP ${res.status} fetching required module ${file}`);
           const text = await res.text();
           if (!text || text.length < 20) throw new Error(`empty response for required module ${file}`);
-          try {
-            new Function(text.replace(/^#!.*\n/, ""));
-          } catch (err) {
-            throw new Error(`syntax check failed for required module ${file}: ${err.message}`);
-          }
+          const reqSyntax = moduleSyntaxError(text);
+          if (reqSyntax) throw new Error(`syntax check failed for required module ${file}: ${reqSyntax}`);
           const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
           fs.writeFileSync(tmpPath, text, "utf8");
           tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
@@ -391,7 +619,7 @@ async function checkAndApplyUpdate() {
   return updateInFlight;
 }
 
-function isFreeTierCliGateError(status, errType, errMsg) {
+function isFreeTierCliGateError(status: number, errType: unknown, errMsg: unknown): boolean {
   if (errType === "FreeTierError" || errType === "UpgradeRequired") return true;
   // 426 is the version-floor handshake: upstream names the minimum client
   // version it will accept. Treat it as a gate signal so the identity layer can
@@ -417,7 +645,7 @@ const identity = require("./identity");
  * to the shipped defaults until the first successful refresh. Resolved per
  * call, so a catalog change applies on the next request.
  */
-function resolveEndpoints(modelId = null) {
+function resolveEndpoints(modelId: string | null = null): Endpoints {
   const derived = identity.getEndpoints(modelId);
   return {
     responsesUrl: process.env.OPENCODE_RESPONSES_URL || derived.responsesUrl || OPENCODE_RESPONSES_URL,
@@ -427,12 +655,12 @@ function resolveEndpoints(modelId = null) {
 }
 
 // The identity (user-agent, session-id format, header set) is owned by
-// identity.js, which derives it from opencode's public source and refreshes it
+// identity.ts, which derives it from opencode's public source and refreshes it
 // lazily — on request, never on a timer. `currentUserAgent` mirrors it for the
 // few call sites that need a plain string.
 let currentUserAgent = process.env.OPENCODE_USER_AGENT || identity.getUserAgent();
 
-function syncUserAgent() {
+function syncUserAgent(): string {
   if (!process.env.OPENCODE_USER_AGENT) currentUserAgent = identity.getUserAgent();
   return currentUserAgent;
 }
@@ -456,7 +684,7 @@ function syncUserAgent() {
  * that answered does not silently move to a different one mid-conversation.
  * Without it, a pool picks per call.
  */
-function upstreamFetch(url, init, egressUrl = null) {
+function upstreamFetch(url: string, init: Record<string, unknown>, egressUrl: string | null = null): Promise<FetchResponse> {
   if (!UPSTREAM_RELAY_URL) return proxy.netFetch(url, init, egressUrl);
   const parsed = new URL(url);
   const headers = { ...(init.headers || {}) };
@@ -476,7 +704,7 @@ function upstreamFetch(url, init, egressUrl = null) {
  * With one proxy (or none) there is nothing to fail over to, so the transport
  * error is rethrown for the caller's existing handling.
  */
-async function egressFetch(url, init, state) {
+async function egressFetch(url: string, init: Record<string, unknown>, state: EgressState): Promise<FetchResponse> {
   try {
     const res = await upstreamFetch(url, init, state.egressUrl);
     state.transportFailures = 0;
@@ -516,7 +744,7 @@ async function egressFetch(url, init, state) {
  * to their previous fixed cooldown. Delta-seconds is the form upstream sends;
  * an HTTP-date is also accepted because the header allows it.
  */
-function retryAfterMs(res) {
+function retryAfterMs(res: FetchResponse | null): number | null {
   const raw = res?.headers?.get?.("retry-after");
   if (!raw) return null;
   const text = String(raw).trim();
@@ -535,7 +763,7 @@ function retryAfterMs(res) {
  * An empty URL is the `direct` pool entry, which is a real egress, so this
  * cannot test truthiness: only a missing state means "nothing to record".
  */
-function recordEgressFailure(state, { reason, cooldownMs = null } = {}) {
+function recordEgressFailure(state: EgressState | null, { reason, cooldownMs = null }: EgressFailure = {}): void {
   const url = state && state.egressUrl;
   if (url === null || url === undefined) return;
   const pool = proxy.describe().pool;
@@ -543,7 +771,7 @@ function recordEgressFailure(state, { reason, cooldownMs = null } = {}) {
   proxy.markFailure(url, { reason, cooldownMs });
 }
 
-function isValidV2UserAgent(ua) {
+function isValidV2UserAgent(ua: unknown): boolean {
   const match = String(ua || "")
     .trim()
     .match(/^opencode\/[a-z0-9-]+\/(\d+)\.\d+\.\d+\/[a-z0-9-]+$/i);
@@ -563,7 +791,7 @@ function isValidV2UserAgent(ua) {
  * override that the gate would reject is reported instead of silently
  * producing a 403 that looks like an allowance problem.
  */
-function gateSafeUserAgent() {
+function gateSafeUserAgent(): string {
   const override = process.env.OPENCODE_USER_AGENT;
   if (override && /^opencode\/[A-Za-z0-9-]+\/\d+\.\d+\.\d+\/[A-Za-z0-9-]+$/i.test(String(override).trim())) {
     return String(override).trim();
@@ -582,10 +810,10 @@ function gateSafeUserAgent() {
 }
 
 // --- ID Generator (matches OpenCode v2 CLI format) ---
-// The shape (charset, total length, multiplier, prefix) comes from identity.js,
+// The shape (charset, total length, multiplier, prefix) comes from identity.ts,
 // which derives it from opencode's own `packages/schema/src/identifier.ts`.
 // Kept as a thin wrapper here so existing call sites and tests keep working.
-function createId(descending, timestamp = Date.now()) {
+function createId(descending: boolean, timestamp: number = Date.now()): string {
   return identity.createId(descending, timestamp);
 }
 
@@ -593,24 +821,24 @@ function createId(descending, timestamp = Date.now()) {
 // No hardcoded fallback: an empty list honestly means "upstream not reached
 // yet", so gateways/harnesses apply their own fallback instead of being
 // served a stale lie.
-let activeModels = [];
+let activeModels: unknown[] = [];
 let cachedModelsPayload = '{"object":"list","data":[]}';
 let lastDiscoveryTime = 0;
 const DISCOVERY_TTL_MS = 60 * 60 * 1000; // Auto-refresh every 1 hour
 // Single-flight: concurrent /v1/models hits after TTL expiry share one upstream
 // fetch instead of stampeding (50 parallel GETs = 1 upstream call, not 50).
-let discoveryInFlight = null;
+let discoveryInFlight: Promise<void> | null = null;
 // CLI version feed is slow (5s timeout) and changes rarely: cache 6h, refresh
 // in parallel so model discovery never waits on it.
 let lastCliVersionCheckTime = 0;
 const CLI_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 
-function rebuildDiscoveryPayloads() {
+function rebuildDiscoveryPayloads(): void {
   cachedModelsPayload = JSON.stringify({ object: "list", data: activeModels });
 }
 rebuildDiscoveryPayloads();
 
-function isLocalOrigin(origin) {
+function isLocalOrigin(origin: unknown): boolean {
   if (typeof origin !== "string" || !origin) return false;
   return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(origin.trim());
 }
@@ -618,7 +846,7 @@ function isLocalOrigin(origin) {
 const LOOPBACK_HOST_RE = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\]|::1)$/i;
 
 /** Hostname from a `Host` header, without the port. IPv6 literals keep brackets off. */
-function hostnameOf(hostHeader) {
+function hostnameOf(hostHeader: unknown): string {
   const raw = String(hostHeader || "").trim();
   if (!raw) return "";
   const v6 = raw.match(/^\[([^\]]+)\](?::\d+)?$/);
@@ -646,7 +874,7 @@ function hostnameOf(hostHeader) {
  * deliberate LAN deployment. A bind address other than a wildcard is allowed
  * automatically, so `HOST=192.168.1.5` keeps its own panel working.
  */
-function allowedAdminHosts() {
+function allowedAdminHosts(): Set<string> {
   const hosts = new Set(["localhost", "127.0.0.1", "::1"]);
   for (const extra of String(process.env.PANEL_ALLOWED_HOSTS || "").split(",")) {
     const trimmed = extra.trim().toLowerCase();
@@ -670,7 +898,7 @@ function allowedAdminHosts() {
   return hosts;
 }
 
-function adminRequestError(req) {
+function adminRequestError(req: IncomingRequestLike): string | null {
   const host = hostnameOf(req.headers?.host).toLowerCase();
   if (!host) return "Header Host wajib ada.";
   if (!allowedAdminHosts().has(host)) {
@@ -720,7 +948,7 @@ function adminRequestError(req) {
  * The `lastCliVersionCheckTime` guard keeps the handshake read at most once per
  * CLI_VERSION_TTL_MS even when called repeatedly.
  */
-async function refreshCliVersion() {
+async function refreshCliVersion(): Promise<UpdateResult> {
   const now = Date.now();
   if (now - lastCliVersionCheckTime < CLI_VERSION_TTL_MS) {
     return { updated: false, reason: "fresh" };
@@ -735,7 +963,7 @@ async function refreshCliVersion() {
 // Single-flight: concurrent callers share one in-flight fetch.
 // The CLI-version feed refreshes in parallel (fire-and-forget) so a slow
 // 5s feed never delays the model list.
-async function discoverModels() {
+async function discoverModels(): Promise<void> {
   if (discoveryInFlight) return discoveryInFlight;
   discoveryInFlight = (async () => {
     refreshCliVersion().catch(() => {});
@@ -818,7 +1046,7 @@ async function discoverModels() {
   }
 }
 
-function normalizeModel(rawModel) {
+function normalizeModel(rawModel: unknown): string {
   if (typeof rawModel !== "string") return "";
   const stripped = rawModel.trim().replace(/^(opencode\/|oc\/|zen\/|9router\/|openai\/)/i, "").trim();
   if (!stripped) return "";
@@ -861,7 +1089,7 @@ const responsesModelSet = new Set(
 );
 const chatModelSet = new Set();
 
-function isResponsesModel(modelId) {
+function isResponsesModel(modelId: unknown): boolean {
   const lower = String(modelId || "").trim().toLowerCase();
   if (!lower) return false;
   if (chatModelSet.has(lower)) return false;
@@ -870,7 +1098,7 @@ function isResponsesModel(modelId) {
 }
 
 /** Test hook: forget learned lane assignments (they persist by design). */
-function __resetProtocolLanes() {
+function __resetProtocolLanes(): void {
   chatModelSet.clear();
   responsesModelSet.clear();
   for (const m of (process.env.RESPONSES_MODELS || "").split(",")) {
@@ -879,7 +1107,7 @@ function __resetProtocolLanes() {
   }
 }
 
-function markProtocolSupport(modelId, useResponses) {
+function markProtocolSupport(modelId: unknown, useResponses: boolean): void {
   const lower = String(modelId || "").trim().toLowerCase();
   if (!lower) return;
   if (useResponses) {
@@ -898,14 +1126,14 @@ function markProtocolSupport(modelId, useResponses) {
 // then it had to contain specific tool names, then (per 9router#4837) the exact
 // schemas. Hardcoding those definitions here meant a code change every time.
 //
-// The definitions now come from identity.js, which derives them at the release
+// The definitions now come from identity.ts, which derives them at the release
 // commit SHA named by the update handshake:
 //   1. source        — `read.ts` / `shell.ts` at that immutable commit
 //   2. DEFAULT_TOOLS — shipped fallback, used until a source read succeeds
 //
 // The names below are kept for the call sites and tests that predate the
 // change; they are read from the live profile, not frozen at load time.
-function getFingerprintNames(scope = null, modelId = null) {
+function getFingerprintNames(scope: string | null = null, modelId: string | null = null): string[] {
   // Only the names actually sent upstream. A capture carries ~10 tools but
   // `TOOL_PROFILE_SCOPE=core` sends a subset; treating the unsent ones as
   // fingerprints would alias an unrelated client tool (`glob` → `glob_client`)
@@ -914,11 +1142,11 @@ function getFingerprintNames(scope = null, modelId = null) {
   return identity.getToolList(false, scope, modelId).map((t) => t.function.name);
 }
 
-function getFingerprintDefinitions() {
+function getFingerprintDefinitions(): Record<string, unknown> {
   return identity.getTools();
 }
 
-function getCanonicalTools(flat, scope = null, modelId = null) {
+function getCanonicalTools(flat: boolean, scope: string | null = null, modelId: string | null = null): unknown[] {
   return identity.getToolList(flat, scope, modelId);
 }
 
@@ -926,7 +1154,7 @@ function getCanonicalTools(flat, scope = null, modelId = null) {
  * Stable JSON for schema comparison. Key order must not affect equality: two
  * definitions that differ only in property order are the same schema.
  */
-function stableStringify(val) {
+function stableStringify(val: unknown): string {
   if (!val || typeof val !== "object") return JSON.stringify(val);
   if (Array.isArray(val)) return "[" + val.map(stableStringify).join(",") + "]";
   const keys = Object.keys(val).sort();
@@ -935,7 +1163,7 @@ function stableStringify(val) {
 
 const EMPTY_MAP = Object.freeze(new Map());
 const paramSigCache = new WeakMap();
-function getParamSig(params) {
+function getParamSig(params: unknown): string {
   if (!params || typeof params !== "object") return stableStringify(params);
   let sig = paramSigCache.get(params);
   if (sig === undefined) {
@@ -945,7 +1173,7 @@ function getParamSig(params) {
   return sig;
 }
 
-function buildIpThrottleHeaders(freeTierMsg, diagnostic = null) {
+function buildIpThrottleHeaders(freeTierMsg: unknown, diagnostic: { shapeOk?: boolean; logId?: string | null } | null = null): Record<string, string> {
   if (!freeTierMsg) return { "Content-Type": "application/json" };
   const retryAfterSec = Math.max(1, Math.ceil((GATE_RETRY_COOLDOWN_MS || 30000) / 1000));
   const headers = {
@@ -961,7 +1189,7 @@ function buildIpThrottleHeaders(freeTierMsg, diagnostic = null) {
   return headers;
 }
 
-function resolveIpThrottleStatus(upstreamStatus, freeTierMsg) {
+function resolveIpThrottleStatus(upstreamStatus: number, freeTierMsg: unknown): number {
   if (freeTierMsg && process.env.IP_LIMIT_STATUS === "429") return 429;
   return upstreamStatus;
 }
@@ -970,7 +1198,7 @@ function resolveIpThrottleStatus(upstreamStatus, freeTierMsg) {
  * Is this client-supplied tool already byte-identical to the fingerprint we
  * would inject? If so it can be passed through untouched.
  */
-function isExactFingerprintDef(tool, key) {
+function isExactFingerprintDef(tool: unknown, key: string): boolean {
   const want = identity.getTools()[key];
   if (!want || !tool || typeof tool !== "object") return false;
   const def = tool.function && typeof tool.function === "object" ? tool.function : tool;
@@ -980,7 +1208,7 @@ function isExactFingerprintDef(tool, key) {
   );
 }
 
-function buildPlaceholderNote(appendedNames) {
+function buildPlaceholderNote(appendedNames: unknown): string {
   if (!Array.isArray(appendedNames) || appendedNames.length === 0) return "";
   const list = appendedNames.map((n) => `\`${n}\``).join(" or ");
   return appendedNames.length > 1
@@ -988,7 +1216,7 @@ function buildPlaceholderNote(appendedNames) {
     : `Do not call the ${list} tool; it is a placeholder that does nothing. Use the other tools you have been given instead.`;
 }
 
-function getToolName(tool) {
+function getToolName(tool: unknown): string {
   if (!tool || typeof tool !== "object") return "";
   if (typeof tool.name === "string") return tool.name.trim();
   if (tool.function && typeof tool.function.name === "string") return tool.function.name.trim();
@@ -1006,7 +1234,7 @@ function getToolName(tool) {
 const BLOCKED_TOOL_NAME_PATTERNS = [/run_code/i];
 const BLOCKED_TOOL_ALIAS = "run_program";
 
-function isBlockedToolName(name) {
+function isBlockedToolName(name: string): boolean {
   return BLOCKED_TOOL_NAME_PATTERNS.some((pattern) => pattern.test(name));
 }
 
@@ -1019,10 +1247,10 @@ function isBlockedToolName(name) {
  *     copy (`read_client`) so both survive, and map responses back
  *   - client does not send it at all   → append the fingerprint definition
  *
- * The definitions are resolved per call from identity.js, so a profile update
+ * The definitions are resolved per call from identity.ts, so a profile update
  * takes effect on the next request without a restart.
  */
-function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = null, modelId = null) {
+function prepareToolsWithFingerprint(clientTools: unknown[] = [], flat: boolean = false, scope: string | null = null, modelId: string | null = null): ToolFingerprintResult {
   const fingerprintNames = getFingerprintNames(scope, modelId);
   const canonical = getCanonicalTools(flat, scope, modelId);
   const canonicalByName = new Map(
@@ -1125,20 +1353,20 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
   };
 }
 
-function prepareResponsesTools(clientTools = [], modelId = null) {
+function prepareResponsesTools(clientTools: unknown[] = [], modelId: string | null = null): unknown[] {
   return prepareToolsWithFingerprint(clientTools, true, null, modelId).tools;
 }
 
-function prepareChatTools(clientTools = [], modelId = null) {
+function prepareChatTools(clientTools: unknown[] = [], modelId: string | null = null): unknown[] {
   return prepareToolsWithFingerprint(clientTools, false, null, modelId).tools;
 }
 
-function restoreClientToolName(name, aliasToOriginal) {
+function restoreClientToolName(name: unknown, aliasToOriginal: Map<string, string> | null): unknown {
   if (!name || !aliasToOriginal || aliasToOriginal.size === 0) return name;
   return aliasToOriginal.get(name) || name;
 }
 
-function extractContent(content) {
+function extractContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
@@ -1158,7 +1386,7 @@ function extractContent(content) {
 // sliced directly, arrays join only text parts up to the limit, objects fall
 // back to a bounded stringify. Used for the headerless session signature so
 // a multi-MB system prompt is never JSON.stringified just for a hash.
-function shortText(content, limit = 1000) {
+function shortText(content: unknown, limit: number = 1000): string {
   if (typeof content === "string") return content.slice(0, limit);
   if (Array.isArray(content)) {
     let out = "";
@@ -1178,7 +1406,7 @@ function shortText(content, limit = 1000) {
   }
 }
 
-function messageSignatureSample(content, limit = 1000) {
+function messageSignatureSample(content: unknown, limit: number = 1000): string {
   if (typeof content === "string") {
     const len = content.length;
     if (len <= limit) return `${len}:${content}`;
@@ -1194,7 +1422,7 @@ function messageSignatureSample(content, limit = 1000) {
   return shortText(content, limit);
 }
 
-function transformResponsesContent(content, role = "user") {
+function transformResponsesContent(content: unknown, role: string = "user"): unknown {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     const hasNonText = content.some(
@@ -1228,7 +1456,7 @@ function transformResponsesContent(content, role = "user") {
 }
 
 // Convert OpenAI messages to OpenCode input format (for Responses API)
-function transformToResponsesInput(messages = [], originalToAlias = null) {
+function transformToResponsesInput(messages: unknown[] = [], originalToAlias: Map<string, string> | null = null): unknown[] {
   const input = [];
   for (const m of Array.isArray(messages) ? messages : []) {
     if (!m) continue;
@@ -1291,8 +1519,8 @@ function transformToResponsesInput(messages = [], originalToAlias = null) {
  * (the bridge never chdir's), and probing them costs a `git` subprocess —
  * measured at 2.5 ms, which is real money on every request.
  */
-let harnessEnvBlockCache = { cwd: null, block: "" };
-function buildHarnessEnvBlock() {
+let harnessEnvBlockCache: { cwd: string | null; block: string } = { cwd: null, block: "" };
+function buildHarnessEnvBlock(): string {
   const cwd = process.cwd();
   if (harnessEnvBlockCache.cwd === cwd && harnessEnvBlockCache.block) {
     return harnessEnvBlockCache.block;
@@ -1325,13 +1553,13 @@ function buildHarnessEnvBlock() {
  * sent one. A client that forwards the CLI's own prompt (or any prompt with an
  * `<env>` block) keeps it verbatim — only the missing anchor is added.
  */
-function withHarnessEnvBlock(systemText) {
+function withHarnessEnvBlock(systemText: unknown): string {
   const text = typeof systemText === "string" ? systemText : "";
   if (/<env>[\s\S]*?Working directory:/.test(text)) return text;
   const block = buildHarnessEnvBlock();
   return text.trim() ? `${text.replace(/\s+$/, "")}\n\n${block}` : block;
 }
-function extractSystemInstructions(messages = [], explicitInstructions = "", placeholderNote = "") {
+function extractSystemInstructions(messages: unknown[] = [], explicitInstructions: unknown = "", placeholderNote: string = ""): string {
   const parts = [];
   if (typeof explicitInstructions === "string" && explicitInstructions.trim()) {
     parts.push(explicitInstructions.trim());
@@ -1347,7 +1575,7 @@ function extractSystemInstructions(messages = [], explicitInstructions = "", pla
   return withHarnessEnvBlock(parts.join("\n\n"));
 }
 
-function transformChatMessages(messages = [], originalToAlias = null, placeholderNote = "") {
+function transformChatMessages(messages: unknown[] = [], originalToAlias: Map<string, string> | null = null, placeholderNote: string = ""): unknown[] {
   const out = [];
   for (const m of Array.isArray(messages) ? messages : []) {
     if (!m) continue;
@@ -1413,7 +1641,7 @@ function transformChatMessages(messages = [], originalToAlias = null, placeholde
   return out;
 }
 
-function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
+function buildUpstreamPayload(body: Record<string, unknown>, targetModel: string, useResponses: boolean, scope: string | null = null): UpstreamPayload {
   const requestedTokens =
     body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens;
   const maxTokens = effectiveMaxTokens(requestedTokens, targetModel, body);
@@ -1495,7 +1723,7 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
  * identically. The cache entry is dropped for the same reason: otherwise the
  * next request from this client would get the stale id back.
  */
-function regenerateSessionId(req, body, staleId) {
+function regenerateSessionId(req: IncomingRequestLike, body: Record<string, unknown>, staleId: string): string {
   for (const [key, entry] of sessionCache) {
     if (entry.sessionId === staleId) sessionCache.delete(key);
   }
@@ -1511,8 +1739,8 @@ function regenerateSessionId(req, body, staleId) {
  * (`sha1("directory:<abs path>")`), and an `opencode` file in the directory
  * overrides both. Derived once and cached: a checkout does not move.
  */
-let cachedProjectId = null;
-function getProjectId() {
+let cachedProjectId: string | null = null;
+function getProjectId(): string {
   if (cachedProjectId) return cachedProjectId;
   try {
     const fs = require("fs");
@@ -1561,7 +1789,7 @@ function getProjectId() {
   }
 }
 
-function buildUpstreamHeaders(req, sessionId) {
+function buildUpstreamHeaders(req: IncomingRequestLike, sessionId: string): Record<string, string> {
   const downstreamUa = req?.headers?.["user-agent"] || "";
   const ua = isValidV2UserAgent(downstreamUa) ? downstreamUa : gateSafeUserAgent();
   const client = req?.headers?.["x-opencode-client"];
@@ -1572,7 +1800,7 @@ function buildUpstreamHeaders(req, sessionId) {
   // the same way — from this bridge's own checkout. A client that supplies the
   // header still wins.
   const project = req?.headers?.["x-opencode-project"] || getProjectId();
-  // The gate header set is derived by identity.js from upstream's own request
+  // The gate header set is derived by identity.ts from upstream's own request
   // builder, so a header added upstream starts being sent on the next request
   // after a refresh. Values this bridge cannot derive are reported, not sent
   // empty: an empty required header is worse than an absent one.
@@ -1600,7 +1828,7 @@ function buildUpstreamHeaders(req, sessionId) {
 }
 
 /** A fresh W3C trace context, shaped like the CLI's. */
-function buildTraceHeaders() {
+function buildTraceHeaders(): Record<string, string> {
   const traceId = crypto.randomBytes(16).toString("hex");
   const spanId = crypto.randomBytes(8).toString("hex");
   const parentSpanId = crypto.randomBytes(8).toString("hex");
@@ -1617,14 +1845,14 @@ function buildTraceHeaders() {
  * and `finish_reason: "stop"` — a fake success. Returns the error text when the
  * event is an error, otherwise null.
  */
-function extractStreamError(ev) {
+function extractStreamError(ev: unknown): string | null {
   const err = ev?.error;
   if (!err) return null;
   if (typeof err === "string") return err;
   return err.message || err.type || JSON.stringify(err);
 }
 
-function extractResponsesFinishReason(ev, hasToolCalls) {
+function extractResponsesFinishReason(ev: unknown, hasToolCalls: boolean): string {
   const status = ev?.response?.status;
   const reason = ev?.response?.incomplete_details?.reason;
   if (ev?.type === "response.incomplete" || status === "incomplete") {
@@ -1636,7 +1864,7 @@ function extractResponsesFinishReason(ev, hasToolCalls) {
 }
 
 // Persistent session cache — preserves upstream prompt/KV cache across turns (LRU)
-const sessionCache = new Map();
+const sessionCache = new Map<string, SessionCacheEntry>();
 const MAX_SESSIONS = 500;
 const SESSION_TTL_MS = 3 * 3600 * 1000;
 let lastFailedGateRetryTime = 0;
@@ -1650,20 +1878,20 @@ let lastIpAbuseAt = 0;
 // when it happened. `x-opencode-log-id` is the only handle upstream gives for
 // a rejected request, so it is recorded rather than discarded — it is what a
 // support request or a bug report needs to be actionable.
-let lastGateDiagnostic = null;
-let lastUpstreamError = null;
+let lastGateDiagnostic: GateDiagnostic | null = null;
+let lastUpstreamError: UpstreamErrorRecord | null = null;
 
 /**
  * Which gate anchors the *actual* outgoing request carried.
  *
  * The gate requires a tool named `read` and an `opencode/*` User-Agent with a
  * session header (see GATE_ANCHOR_TOOL_NAMES / GATE_ANCHOR_HEADER_NAMES in
- * identity.js). When a 403 comes back, these are what distinguishes "this
+ * identity.ts). When a 403 comes back, these are what distinguishes "this
  * bridge sent an unacceptable shape" from "upstream refuses this egress".
  * Reporting the distinction is the whole point: both produce an identical
  * FreeTierError body.
  */
-function auditGateShape(upstreamBody, headers) {
+function auditGateShape(upstreamBody: unknown, headers: Record<string, unknown>): GateShape {
   const tools = Array.isArray(upstreamBody?.tools) ? upstreamBody.tools : [];
   const toolNames = tools.map((t) => t?.function?.name || t?.name).filter(Boolean);
   // Header names are compared case-insensitively: the audit must not report a
@@ -1684,7 +1912,7 @@ function auditGateShape(upstreamBody, headers) {
   };
 }
 
-function upstreamLogIdOf(upstreamRes) {
+function upstreamLogIdOf(upstreamRes: FetchResponse | null): string | null {
   return typeof upstreamRes?.headers?.get === "function"
     ? upstreamRes.headers.get("x-opencode-log-id")
     : null;
@@ -1697,10 +1925,10 @@ function upstreamLogIdOf(upstreamRes) {
  * identity layer is not consulted, no session id is re-minted, and the request
  * is not replayed — measured (and confirmed by upstream's own issue tracker)
  * as a network flag that no client shape can clear. The refusal reaches the
- * client verbatim; `X-OpenCode-Gate: ip-abuse` lets callers and `verify.js`
+ * client verbatim; `X-OpenCode-Gate: ip-abuse` lets callers and `verify.ts`
  * tell it apart from the shape gate without parsing the message.
  */
-function respondIpAbuse(res, status, errType, errMsg, logId, model) {
+function respondIpAbuse(res: ServerResponseLike, status: number, errType: unknown, errMsg: string, logId: string | null, model: string): void {
   lastIpAbuseAt = Date.now();
   lastGateDiagnostic = {
     at: lastIpAbuseAt,
@@ -1739,7 +1967,7 @@ sessionCache.clear = () => {
   return origSessionCacheClear();
 };
 
-function getPersistentSessionId(req, body) {
+function getPersistentSessionId(req: IncomingRequestLike, body: Record<string, unknown>): string {
   const headers = req?.headers || {};
   const rawHeaderKey =
     headers["x-opencode-session"] ||
@@ -1806,8 +2034,8 @@ function getPersistentSessionId(req, body) {
  * The panel is the only caller, so the contract stays small: JSON in, JSON out,
  * one error field. Credentials are accepted on write and never echoed on read.
  */
-async function handleProxyApi(req, res, pathname) {
-  const send = (status, body) => {
+async function handleProxyApi(req: IncomingRequestLike, res: ServerResponseLike, pathname: string): Promise<unknown> {
+  const send = (status: number, body: unknown) => {
     res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
     res.end(JSON.stringify(body));
   };
@@ -1893,7 +2121,7 @@ async function handleProxyApi(req, res, pathname) {
   return send(400, { error: "Body harus berisi 'url' (satu proxy) atau 'entries' (pool)." });
 }
 
-function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
+function readRequestBody(req: IncomingRequestLike, maxBytes: number = MAX_BODY_BYTES): Promise<string> {
   // Early reject: if the client declares a huge body, refuse without reading
   // a single byte instead of buffering up to the limit first.
   const declared = parseInt(req?.headers?.["content-length"] || "", 10);
@@ -1958,7 +2186,7 @@ function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
 }
 
 // --- HTTP Server ---
-function handleRequest(req, res) {
+function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void {
   req.on("error", (err) => {
     console.warn("[opencode-free-bridge] request stream error:", err.message);
   });
@@ -3352,7 +3580,7 @@ function handleRequest(req, res) {
   res.end(JSON.stringify({ error: { message: "Not found", type: "invalid_request_error" } }));
 }
 
-async function consumeSseLines(reader, decoder, onLine) {
+async function consumeSseLines(reader: StreamReader, decoder: TextDecoder, onLine: (line: string) => void): Promise<void> {
   let buffer = "";
   while (true) {
     const { done, value } = await reader.read();
@@ -3395,7 +3623,7 @@ async function consumeSseLines(reader, decoder, onLine) {
 
 const server = http.createServer(handleRequest);
 
-// Only auto-start when executed directly (`node server.js`), so unit tests can
+// Only auto-start when executed directly (`bun server.ts`), so unit tests can
 // require("./server") without binding the default port or starting timers.
 // The transport fingerprint is a property of the HTTP runtime, not of this code.
 // Measured from one IP in one minute with identical headers and body: the real
@@ -3406,7 +3634,7 @@ const server = http.createServer(handleRequest);
 const ON_BUN = typeof Bun !== "undefined";
 const ALLOW_NODE = process.env.ALLOW_NODE === "1";
 
-function refuseNodeRuntime() {
+function refuseNodeRuntime(): void {
   const lines = [
     "",
     "  opencode-free-bridge requires Bun.",
@@ -3443,7 +3671,7 @@ if (require.main === module) {
     }
   });
   // Repair a half-installed tree (an older self-updater that did not know about
-  // proxy.js/panel.js) after the socket is open, so a slow or absent network
+  // proxy.ts/panel.ts) after the socket is open, so a slow or absent network
   // never delays startup. The panel reads the current binding per request, so
   // it starts working as soon as the repair lands.
   repairMissingModules().catch(() => {});

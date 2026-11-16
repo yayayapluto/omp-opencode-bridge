@@ -4,14 +4,14 @@ const assert = require("node:assert");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
-const PROXY = path.join(__dirname, "..", "egress-proxy.js");
+const PROXY = path.join(__dirname, "..", "egress-proxy.ts");
 
 /**
  * Ask a process that *runs* the proxy what resolver order it ended up with.
  *
  * The assertion has to observe the proxy's own process, not the test's: the
- * bug it guards was that `egress-proxy.js` dialled upstream in Bun's default
- * `verbatim` order while `server.js` pinned `ipv4first`. The gateway refuses
+ * bug it guards was that `egress-proxy.ts` dialled upstream in Bun's default
+ * `verbatim` order while `server.ts` pinned `ipv4first`. The gateway refuses
  * IPv6 egress, so every pool member on a dual-stack host tunnelled requests out
  * over the family that answers `429` and took the whole pool down for a day.
  */
@@ -44,7 +44,7 @@ test("egress-proxy dials upstream IPv4-first by default", () => {
   assert.equal(resolveOrderInProxyProcess({}), "ipv4first");
 });
 
-test("egress-proxy honours DNS_RESULT_ORDER like server.js does", () => {
+test("egress-proxy honours DNS_RESULT_ORDER like server.ts does", () => {
   // `ipv6first` exists from Node 22. On an older runtime the proxy must fall
   // back to an order it understands instead of throwing at module load, which
   // killed the process before it could listen (CI: compat 18.x went red).

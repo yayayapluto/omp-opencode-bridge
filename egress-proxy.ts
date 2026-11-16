@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 /**
- * egress-proxy.js: a minimal HTTP proxy, for turning a host into one pool entry.
+ * egress-proxy.ts: a minimal HTTP proxy, for turning a host into one pool entry.
  *
- * The bridge's pool speaks HTTP CONNECT (see proxy.js), so each pool member
+ * The bridge's pool speaks HTTP CONNECT (see proxy.ts), so each pool member
  * needs something that answers CONNECT and forwards bytes — nothing more. This
  * is that: one process, no dependencies, no caching, no inspection. It exists
  * because the alternative is a full squid/nginx install on hosts where the
@@ -18,7 +18,7 @@
  * host is the tunnel's job (an SSH `-L`), which also carries the authentication,
  * so a token is optional and only meaningful when the listener is exposed.
  *
- *   PORT=8888 EGRESS_PROXY_TOKEN=secret bun egress-proxy.js
+ *   PORT=8888 EGRESS_PROXY_TOKEN=secret bun egress-proxy.ts
  *   curl -x http://secret@node:8888 https://api.ipify.org
  */
 
@@ -31,7 +31,7 @@ const dns = require("dns");
 // `429 FreeUsageLimitError` over IPv6). Bun's default order is `verbatim`,
 // which on a dual-stack host resolves `opencode.ai` to AAAA first, so a pool
 // member would tunnel every request out over the family the gateway refuses.
-// `server.js` sets the same order for its own fetches; this process dials the
+// `server.ts` sets the same order for its own fetches; this process dials the
 // upstream itself for every CONNECT, so it needs it too.
 //
 // `ipv6first` only exists from Node 22. Calling setDefaultResultOrder with an
@@ -39,7 +39,7 @@ const dns = require("dns");
 // this runs at module load the proxy dies before it ever listens — an operator
 // on Node 18 who set DNS_RESULT_ORDER=ipv6first lost the proxy entirely. The
 // preference is honoured where it is understood and announced where it is not.
-const dnsOrder = (() => {
+const dnsOrder: string | null = (() => {
   const wanted = String(process.env.DNS_RESULT_ORDER || "ipv4first").trim().toLowerCase();
   for (const order of [wanted, "ipv4first", "verbatim"]) {
     try {
@@ -65,7 +65,7 @@ const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || "512", 10);
 let active = 0;
 const startedAt = Date.now();
 
-function authorized(req) {
+function authorized(req: http.IncomingMessage): boolean {
   if (!TOKEN) return true;
   // Proxy-Authorization: Basic base64(user:token). Only the password is
   // checked, because a proxy URL's user part is conventionally free-form.
@@ -82,7 +82,7 @@ function authorized(req) {
   return password === TOKEN;
 }
 
-function requireAuth(res) {
+function requireAuth(res: http.ServerResponse): void {
   res.writeHead(407, {
     "Proxy-Authenticate": 'Basic realm="egress"',
     "Content-Type": "text/plain",
@@ -126,7 +126,11 @@ const server = http.createServer((req, res) => {
 });
 
 /** Plaintext HTTP forwarding: replay the request with origin-form path. */
-function forwardHttp(clientReq, clientRes, target) {
+function forwardHttp(
+  clientReq: http.IncomingMessage,
+  clientRes: http.ServerResponse,
+  target: URL
+): void {
   if (active >= MAX_CONNECTIONS) {
     clientRes.writeHead(503, { "Content-Type": "application/json" });
     clientRes.end(JSON.stringify({ error: "proxy connection limit reached" }));
@@ -134,7 +138,7 @@ function forwardHttp(clientReq, clientRes, target) {
   }
   active += 1;
 
-  const headers = { ...clientReq.headers };
+  const headers: http.OutgoingHttpHeaders = { ...clientReq.headers };
   delete headers["proxy-authorization"];
   delete headers["proxy-connection"];
   headers.host = target.host;
@@ -170,7 +174,7 @@ function forwardHttp(clientReq, clientRes, target) {
 }
 
 /** CONNECT: open a raw TCP tunnel and join both directions. */
-server.on("connect", (req, clientSocket, head) => {
+server.on("connect", (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
   if (!authorized(req)) {
     clientSocket.end("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"egress\"\r\n\r\n");
     return;
@@ -214,7 +218,7 @@ server.on("connect", (req, clientSocket, head) => {
   clientSocket.on("close", close);
 });
 
-function splitHostPort(value) {
+function splitHostPort(value: string): [string | null, string | null] {
   if (value.startsWith("[")) {
     const end = value.indexOf("]");
     if (end === -1) return [null, null];

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * gate-drill.js — prove the reactive self-heal against the *real* upstream gate.
+ * gate-drill.ts — prove the reactive self-heal against the *real* upstream gate.
  *
  * This is not a unit test. It deliberately starts the bridge in a state that
  * upstream rejects, sends one client request, and checks that the bridge heals
@@ -46,13 +46,13 @@
  * because upstream applies a per-IP cooldown after a burst of failures.
  *
  * Usage:
- *   bun gate-drill.js            # all drills
- *   bun gate-drill.js full-corrupt  # one drill
+ *   bun gate-drill.ts            # all drills
+ *   bun gate-drill.ts full-corrupt  # one drill
  */
 
 const http = require("http");
 
-const DRILLS = [
+const DRILLS: string[] = [
   "version-floor",
   "legacy-shape",
   "empty-tools",
@@ -65,7 +65,61 @@ const DRILLS = [
   "full-corrupt",
 ];
 
-function ask(port, body) {
+/** Token usage as the bridge reports it. */
+interface Usage {
+  completion_tokens?: number;
+}
+
+/** One completion, SSE chunk, or error envelope — only the fields read here. */
+interface CompletionBody {
+  choices?: Array<{
+    message?: { role?: string; content?: string; reasoning_content?: string };
+    delta?: { content?: string; reasoning_content?: string };
+    finish_reason?: string | null;
+  }>;
+  usage?: Usage | null;
+  error?: { message?: string };
+  tools?: unknown[];
+}
+
+/** One answer from the bridge, already folded back to a completion. */
+interface DrillResponse {
+  status: number;
+  json: CompletionBody | null;
+  text: string;
+}
+
+/**
+ * The identity module surface the drills stage state through. Declared here
+ * rather than imported: identity is CommonJS, so its shape is the exported
+ * object, and this is the only slice a drill touches.
+ */
+interface IdentityModule {
+  getState(): { versionFloor?: string | null; toolNames?: string[] };
+  getRecipe(): { version: string; sessionPrefix: string; sessionLength: number; sessionCharset: string };
+  getTools(): Record<string, unknown>;
+  getToolList(core: boolean, scope?: string): Array<{ function: { name: string } }>;
+  getEndpoints(): { chatUrl: string };
+  getUserAgent(): string;
+  getSessionPrefix(): string;
+  createSessionId(fresh: boolean): string;
+  applyRecipe(patch: Record<string, unknown>, tag?: string): void;
+  refresh(options?: { force?: boolean }): Promise<unknown>;
+  onGateRejection: (status: number, type: string, message: string, attempted: boolean) => Promise<{ retry: boolean; reason: string }>;
+  __setLastCheckTime(ms: number): void;
+  __setToolProfile(profile: Record<string, unknown> | null, tag: string): void;
+  __setSessionPrefix(prefix: string): void;
+  DEFAULT_TOOLS: Record<string, unknown>;
+}
+
+/** What main() hands each drill. */
+interface DrillContext {
+  identity: IdentityModule;
+  __syncUserAgent: () => void;
+  sessionCache: Map<string, { sessionId: string }>;
+}
+
+function ask(port: number, body: Record<string, unknown>): Promise<DrillResponse> {
   return new Promise((resolve, reject) => {
     // The live drills must exercise the shape upstream actually accepts. A
     // request without `stream` is refused with 403 FreeTierError before its
@@ -106,16 +160,16 @@ function ask(port, body) {
 }
 
 /** Fold an SSE answer from the bridge into one completion object. */
-function assembleSse(raw) {
+function assembleSse(raw: string): CompletionBody {
   let content = "";
   let reasoning = "";
-  let finish = null;
-  let usage = null;
+  let finish: string | null = null;
+  let usage: Usage | null = null;
   for (const line of raw.split("\n")) {
     if (!line.startsWith("data:")) continue;
     const chunk = line.slice(5).trim();
     if (!chunk || chunk === "[DONE]") continue;
-    let ev = null;
+    let ev: CompletionBody | null = null;
     try { ev = JSON.parse(chunk); } catch { continue; }
     if (ev?.error) return { error: ev.error };
     const choice = ev?.choices?.[0];
@@ -130,12 +184,12 @@ function assembleSse(raw) {
   };
 }
 
-function content(res) {
+function content(res: DrillResponse): string {
   const msg = res.json?.choices?.[0]?.message;
   return (msg?.content || "").trim();
 }
 
-function line(ok, label, detail = "") {
+function line(ok: boolean, label: string, detail: string = ""): void {
   const mark = ok ? "OK  " : "FAIL";
   console.log(`  ${mark} ${label}${detail ? "  " + detail : ""}`);
 }
@@ -148,22 +202,22 @@ function line(ok, label, detail = "") {
  * probe treats it the same way), so an assertion that depends on upstream
  * answering is `null` rather than a false failure.
  */
-function lineMaybe(ok, label, detail = "") {
+function lineMaybe(ok: boolean | null, label: string, detail: string = ""): void {
   const mark = ok === null ? "SKIP" : ok ? "OK  " : "FAIL";
   console.log(`  ${mark} ${label}${detail ? "  " + detail : ""}`);
 }
 
 /** Upstream answered with capacity pressure instead of a gate verdict. */
-function isBusy(res) {
+function isBusy(res: { status: number }): boolean {
   return res.status === 429;
 }
 
 /** `ok`, or `null` when upstream gave no verdict to judge. */
-function judge(ok, undecided) {
+function judge(ok: boolean, undecided: boolean): boolean | null {
   return ok ? true : undecided ? null : false;
 }
 
-async function waitHealthy(port, timeoutMs = 30000) {
+async function waitHealthy(port: number, timeoutMs: number = 30000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
@@ -175,7 +229,7 @@ async function waitHealthy(port, timeoutMs = 30000) {
   return false;
 }
 
-async function drillVersionFloor({ identity, __syncUserAgent }) {
+async function drillVersionFloor({ identity, __syncUserAgent }: DrillContext): Promise<boolean | null> {
   console.log("\nversion-floor — UA below the advertised floor (426 UpgradeRequired)");
   const floorBefore = identity.getState().versionFloor;
 
@@ -225,7 +279,7 @@ async function drillVersionFloor({ identity, __syncUserAgent }) {
   return judge(answered, busy);
 }
 
-async function drillLegacyShape({ identity, __syncUserAgent }) {
+async function drillLegacyShape({ identity, __syncUserAgent }: DrillContext): Promise<boolean | null> {
   console.log("\nlegacy-shape — the v1.5.0 access pattern, through the current bridge");
   console.log("  (control: this shape is accepted upstream, so it must keep working)");
 
@@ -265,7 +319,7 @@ async function drillLegacyShape({ identity, __syncUserAgent }) {
   return judge(answered, busy);
 }
 
-async function drillEmptyTools({ identity }) {
+async function drillEmptyTools({ identity }: DrillContext): Promise<boolean | null> {
   console.log("\nempty-tools — profile resolves to nothing (upstream 403 FreeTierError)");
   const before = identity.getToolList(false).map((t) => t.function.name);
 
@@ -294,7 +348,7 @@ async function drillEmptyTools({ identity }) {
   return judge(answered, busy);
 }
 
-async function drillSessionShape({ identity, __syncUserAgent, sessionCache }) {
+async function drillSessionShape({ identity, __syncUserAgent, sessionCache }: DrillContext): Promise<boolean | null> {
   console.log("\nsession-shape — id upstream reads as \"not OpenCode\" (403 FreeTierError)");
   console.log("  measured rule: `ses_` + 12 lowercase hex + 14 base62 (30 chars)");
 
@@ -353,7 +407,7 @@ async function drillSessionShape({ identity, __syncUserAgent, sessionCache }) {
  * at boot: it repoints the chat endpoint at a local fake *after* the bridge is
  * up, sends a request, and checks the fake received it.
  */
-async function drillRouting({ identity }) {
+async function drillRouting({ identity }: DrillContext): Promise<boolean> {
   console.log("\nrouting — endpoint derived at request time, not frozen at boot");
 
   const received = [];
@@ -415,7 +469,7 @@ async function drillRouting({ identity }) {
  * (the scope the gate-rejection retry uses) even when everything else is
  * unchanged, which is what makes an upstream rename self-healing.
  */
-async function drillAllowlist({ identity }) {
+async function drillAllowlist({ identity }: DrillContext): Promise<boolean> {
   console.log("\nallowlist — source-derived tool names reach the wire");
 
   const before = identity.getState().toolNames;
@@ -454,7 +508,7 @@ async function drillAllowlist({ identity }) {
  * healthy fake at the catalog-derived URL, then checks the retry lands on the
  * latter.
  */
-async function drillRetryEndpoint({ identity }) {
+async function drillRetryEndpoint({ identity }: DrillContext): Promise<boolean> {
   console.log("\nretry-endpoint — the self-heal retry uses the refreshed endpoint");
 
   const hits = [];
@@ -536,7 +590,7 @@ async function drillRetryEndpoint({ identity }) {
  * local servers stand in for the old and new paths, so the drill is
  * deterministic and does not depend on what upstream currently serves.
  */
-async function drillEndpointMove({ identity }) {
+async function drillEndpointMove({ identity }: DrillContext): Promise<boolean> {
   console.log("\nendpoint-move — a 404 at the stale path re-derives and retries");
 
   const hits = [];
@@ -622,7 +676,7 @@ async function drillEndpointMove({ identity }) {
  * the configured egress proxy, so its verdict describes the IP upstream would
  * actually see.
  */
-async function probeUpstream(identity) {
+async function probeUpstream(identity: IdentityModule): Promise<{ open: boolean; status: number; detail: string }> {
   const { buildUpstreamPayload, buildUpstreamHeaders, resolveEndpoints } = require("./server");
   const model = "big-pickle";
   const sessionId = identity.createSessionId(true);
@@ -671,16 +725,16 @@ async function probeUpstream(identity) {
  * heal (stale request → refresh → re-minted id → full tool set → retry → 200),
  * which is what the bridge controls; whether upstream is in the mood is not.
  */
-async function drillGateHeal({ identity }) {
+async function drillGateHeal({ identity }: DrillContext): Promise<boolean> {
   console.log("\ngate-heal — reactive heal, deterministic fake gate (no live upstream)");
 
-  const seen = [];
+  const seen: Array<{ ok: boolean; sid: string; toolCount: number }> = [];
   let rejectedOnce = false;
   const fake = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", () => {
-      let body = {};
+      let body: CompletionBody = {};
       try {
         body = JSON.parse(raw);
       } catch {}
@@ -798,7 +852,7 @@ async function drillGateHeal({ identity }) {
  * Everything is asserted against the values derived from source, not against
  * hardcoded expectations, so this keeps working when upstream changes them.
  */
-async function drillFullCorrupt({ identity }) {
+async function drillFullCorrupt({ identity }: DrillContext): Promise<boolean> {
   console.log("\nfull-corrupt — every layer broken at once, one request heals them");
 
   await identity.refresh({ force: true });
@@ -812,12 +866,12 @@ async function drillFullCorrupt({ identity }) {
   };
 
   const SESSION = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
-  const seen = [];
+  const seen: Array<{ sid: string; ua: string; toolCount: number; bad: string[] }> = [];
   const fake = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", () => {
-      let body = {};
+      let body: CompletionBody = {};
       try {
         body = JSON.parse(raw);
       } catch {}
@@ -934,7 +988,7 @@ async function drillFullCorrupt({ identity }) {
   );
 }
 
-async function main() {
+async function main(): Promise<void> {
   const wanted = process.argv.slice(2).filter((a) => !a.startsWith("-"));
   const drills = wanted.length > 0 ? wanted : DRILLS;
   const unknown = drills.filter((d) => !DRILLS.includes(d));
@@ -978,13 +1032,13 @@ async function main() {
     await new Promise((r) => setTimeout(r, 3000));
   }
 
-  const results = [];
+  const results: Array<[string, boolean | null]> = [];
   for (const name of drills) {
     if (LIVE.has(name) && !gateOpen) {
       results.push([name, null]); // skipped, not failed
       continue;
     }
-    const DRILL_FNS = {
+    const DRILL_FNS: Record<string, (ctx: DrillContext) => Promise<boolean | null>> = {
       "version-floor": drillVersionFloor,
       "legacy-shape": drillLegacyShape,
       "empty-tools": drillEmptyTools,
@@ -1000,7 +1054,7 @@ async function main() {
     // A cached session id from a previous drill would be reused for an
     // identical message and hide the condition being staged.
     sessionCache.clear();
-    const ctx = { identity, __syncUserAgent, sessionCache };
+    const ctx: DrillContext = { identity, __syncUserAgent, sessionCache };
     try {
       results.push([name, await fn(ctx)]);
     } catch (err) {
@@ -1028,7 +1082,7 @@ async function main() {
   process.exit(failed.length === 0 ? 0 : 1);
 }
 
-let port = () => 0;
+let port: () => number = () => 0;
 
 // Exported for test/drill-semantics.test.js: the tri-state verdict contract
 // (true / null / false) is what keeps an undecided live drill from failing CI.

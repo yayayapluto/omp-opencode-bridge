@@ -38,9 +38,14 @@ const MIN_PLAIN_TOKENS = 512;
 // outright (`reasoning: true` on every live free model), and the catalog is
 // cached on disk after its first fetch, so the bridge asks it instead of
 // maintaining a hand-written substring list.
-const REASONING_MODEL_HINTS = Object.freeze([]);
+const REASONING_MODEL_HINTS: readonly string[] = Object.freeze([]);
 
-function isReasoningModel(modelId) {
+/** The parts of a chat request body this module reads. */
+interface ReasoningRequestBody {
+  reasoning_effort?: unknown;
+}
+
+function isReasoningModel(modelId: unknown): boolean {
   const id = String(modelId || "").toLowerCase();
   if (!id) return false;
   try {
@@ -54,7 +59,7 @@ function isReasoningModel(modelId) {
 
 // A request counts as reasoning-bound when it targets a known thinking model,
 // or when the client explicitly asked for reasoning effort.
-function isReasoningRequest(body, modelId) {
+function isReasoningRequest(body: ReasoningRequestBody | null | undefined, modelId: unknown): boolean {
   if (isReasoningModel(modelId)) return true;
   const effort = body && body.reasoning_effort;
   return Boolean(effort) && effort !== "none";
@@ -63,7 +68,7 @@ function isReasoningRequest(body, modelId) {
 // Clamp the client's requested budget into a range that always leaves room for
 // a visible answer. The client's value is never lowered — only raised when it
 // is too small to survive the model's reasoning phase.
-function parseRequestedTokens(requested) {
+function parseRequestedTokens(requested: unknown): number {
   if (requested === undefined || requested === null || typeof requested === "boolean") {
     return MAX_OUTPUT_TOKENS;
   }
@@ -77,7 +82,11 @@ function parseRequestedTokens(requested) {
   return Math.floor(raw);
 }
 
-function effectiveMaxTokens(requested, modelId, body) {
+function effectiveMaxTokens(
+  requested: unknown,
+  modelId?: unknown,
+  body?: ReasoningRequestBody | null
+): number {
   const wanted = parseRequestedTokens(requested);
 
   const effective = isReasoningRequest(body, modelId)

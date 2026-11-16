@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * transport-fingerprint.js — record and compare the outbound TLS ClientHello.
+ * transport-fingerprint.ts — record and compare the outbound TLS ClientHello.
  *
  * Why this exists: the free-tier gate checks the transport, not just headers.
  * Measured from one IP in one minute with identical requests:
@@ -16,9 +16,9 @@
  * visible: it opens a TCP listener, points a fetch at it, and parses the
  * ClientHello without any TLS library.
  *
- *   bun transport-fingerprint.js                 print this runtime's fingerprint
- *   bun transport-fingerprint.js --check         exit 1 if it drifted from the baseline
- *   bun transport-fingerprint.js --write-baseline  record the current fingerprint
+ *   bun transport-fingerprint.ts                 print this runtime's fingerprint
+ *   bun transport-fingerprint.ts --check         exit 1 if it drifted from the baseline
+ *   bun transport-fingerprint.ts --write-baseline  record the current fingerprint
  *
  * The fingerprint is the cipher list and the extension set + order. The
  * `random` and `key_share` fields differ on every connection by design and are
@@ -30,8 +30,22 @@ const path = require("path");
 
 const BASELINE = path.join(__dirname, "transport-baseline.json");
 
+/** The transport-identifying part of a ClientHello. */
+interface ClientHelloFingerprint {
+  legacyVersion: string;
+  ciphers: string[];
+  extensions: string[];
+}
+
+/** A fingerprint plus the runtime that produced it, as recorded in the baseline. */
+interface FingerprintReport extends ClientHelloFingerprint {
+  runtime: string;
+  cipherCount: number;
+  extensionCount: number;
+}
+
 /** Parse a TLS ClientHello record. No TLS library: the bytes are the API. */
-function parseClientHello(buf) {
+function parseClientHello(buf: Buffer): ClientHelloFingerprint {
   if (!Buffer.isBuffer(buf) || buf.length < 43 || buf[0] !== 0x16) {
     throw new Error("not a TLS handshake record");
   }
@@ -72,10 +86,10 @@ function parseClientHello(buf) {
 }
 
 /** Capture this runtime's ClientHello by pointing a fetch at a local listener. */
-function capture() {
+function capture(): Promise<ClientHelloFingerprint> {
   return new Promise((resolve, reject) => {
     const srv = net.createServer((sock) => {
-      sock.once("data", (buf) => {
+      sock.once("data", (buf: Buffer) => {
         sock.destroy();
         srv.close();
         try {
@@ -87,7 +101,8 @@ function capture() {
     });
     srv.on("error", reject);
     srv.listen(0, "127.0.0.1", () => {
-      const { port } = srv.address();
+      // `listen(0, ...)` with an IP always yields an AddressInfo.
+      const { port } = srv.address() as { port: number };
       fetch(`https://127.0.0.1:${port}/`, { method: "POST" }).catch(() => {});
       setTimeout(() => {
         try {
@@ -99,7 +114,7 @@ function capture() {
   });
 }
 
-function describe(fp) {
+function describe(fp: ClientHelloFingerprint): FingerprintReport {
   const runtime = process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`;
   return {
     runtime,
@@ -111,7 +126,7 @@ function describe(fp) {
   };
 }
 
-async function main() {
+async function main(): Promise<number> {
   const fp = await capture();
   const now = describe(fp);
   const wantWrite = process.argv.includes("--write-baseline");
@@ -128,7 +143,7 @@ async function main() {
       console.error(`no baseline at ${BASELINE}; run with --write-baseline first`);
       return 2;
     }
-    const base = JSON.parse(fs.readFileSync(BASELINE, "utf8"));
+    const base: FingerprintReport = JSON.parse(fs.readFileSync(BASELINE, "utf8"));
     const sameCiphers = JSON.stringify(base.ciphers) === JSON.stringify(now.ciphers);
     const sameExts = JSON.stringify(base.extensions) === JSON.stringify(now.extensions);
     if (sameCiphers && sameExts) {

@@ -1,5 +1,5 @@
 "use strict";
-// Semantics contract of gate-drill.js: an undecided live drill is a SKIP, not
+// Semantics contract of gate-drill.ts: an undecided live drill is a SKIP, not
 // a failure. 2026-11 CI: a 429 burst closed the upstream gate, the live drills
 // could not be judged, and undecided results were counted as failures — the
 // pipeline went red on a healthy bridge. These tests pin the tri-state
@@ -11,9 +11,9 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const drill = require("../gate-drill.js");
+const drill = require("../gate-drill.ts");
 const { judge, DRILLS } = drill;
-const DRILL_SRC = fs.readFileSync(path.join(__dirname, "..", "gate-drill.js"), "utf8");
+const DRILL_SRC = fs.readFileSync(path.join(__dirname, "..", "gate-drill.ts"), "utf8");
 
 test("judge: a passing check is true regardless of gate state", () => {
   assert.strictEqual(judge(true, true), true);
@@ -68,7 +68,7 @@ test("busy-gate heal assertions in the live drills use the tri-state", () => {
   ]) {
     const start = DRILL_SRC.indexOf(`async function ${name}(`);
     const next = DRILL_SRC.indexOf(`async function ${nextName}(`);
-    assert.ok(start > 0 && next > start, `${name} not found in gate-drill.js`);
+    assert.ok(start > 0 && next > start, `${name} not found in gate-drill.ts`);
     const body = DRILL_SRC.slice(start, next);
     const busyAware = body.match(/lineMaybe\(judge\([^)]*busy\)/g) ?? [];
     assert.ok(
