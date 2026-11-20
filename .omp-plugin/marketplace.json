@@ -1,0 +1,15 @@
+{
+  "name": "omp-opencode-bridge",
+  "description": "Free OpenCode models for OMP/pi: a local OpenAI-compatible bridge with no account, plus the keyless provider plugin.",
+  "owner": {
+    "name": "yayayapluto"
+  },
+  "plugins": [
+    {
+      "name": "omp-opencode-bridge",
+      "source": "./",
+      "version": "2.6.0",
+      "description": "Registers the opencode-free provider, starts a local Bun bridge, serves free OpenCode models, and manages the bridge from /opencode-free."
+    }
+  ]
+}
