@@ -13,6 +13,13 @@ const proxy = require("../proxy");
 const panel = require("../panel");
 const srv = require("../server");
 
+// Windows reports 0666 for every file; chmod(0600) only has meaning on POSIX.
+// The no-credential-leak assertions below still run on every platform.
+const POSIX_FILE_MODES = process.platform !== "win32";
+function assertOwnerOnly(file, message) {
+  if (POSIX_FILE_MODES) assert.equal(fs.statSync(file).mode & 0o777, 0o600, message);
+}
+
 function request(port, method, urlPath, body, headers = {}) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : JSON.stringify(body);
@@ -90,7 +97,7 @@ describe("egress proxy", () => {
     assert.equal(JSON.stringify(saved).includes("secret"), false, "describe() must not leak the password");
 
     const file = proxy.configFile();
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assertOwnerOnly(file, "proxy config must be owner-only");
     assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).url, "http://user:secret@10.0.0.5:8080");
 
     // A fresh process reads the same file.
@@ -392,7 +399,7 @@ describe("egress pool", () => {
     assert.equal(JSON.stringify(saved).includes("secret"), false, "describe() must not leak credentials");
 
     const file = proxy.configFile();
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assertOwnerOnly(file, "pool config must be owner-only");
     const onDisk = JSON.parse(fs.readFileSync(file, "utf8"));
     assert.equal(onDisk.pool.length, 2);
     assert.equal(onDisk.strategy, "failover");
@@ -679,7 +686,7 @@ describe("egress pool: health survives a restart", () => {
     proxy.setPool({ entries: ["http://user:secret@a:1"] });
     proxy.markFailure("http://user:secret@a:1", { reason: "allowance 429" });
     const raw = fs.readFileSync(proxy.healthFile(), "utf8");
-    assert.equal(fs.statSync(proxy.healthFile()).mode & 0o777, 0o600);
+    assertOwnerOnly(proxy.healthFile(), "pool health must be owner-only");
     // A second copy of every proxy token would be a second thing to leak. The
     // record is keyed by an opaque hash of the egress identity, and the label
     // carries only what `describe()` already exposes (host:port).

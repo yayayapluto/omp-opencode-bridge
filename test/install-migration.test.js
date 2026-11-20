@@ -61,10 +61,10 @@ test("installer ships tunnel-doctor.sh, and validates it before swapping files",
   // before the running bridge is stopped. Compare against the *call* site:
   // indexOf("stop_own_bridge") would find the function definition at line 255.
   const syntaxAt = src.indexOf("bash -n");
-  const stopAt = src.indexOf("\nstop_own_bridge\n");
+  const stopMatch = src.match(/\r?\nstop_own_bridge\r?\n/);
   assert.ok(syntaxAt > -1, "installer never syntax-checks tunnel-doctor.sh");
-  assert.ok(stopAt > -1, "installer never calls stop_own_bridge");
-  assert.ok(syntaxAt < stopAt, "tunnel-doctor.sh must be validated before the old bridge is stopped");
+  assert.ok(stopMatch, "installer never calls stop_own_bridge");
+  assert.ok(syntaxAt < stopMatch.index, "tunnel-doctor.sh must be validated before the old bridge is stopped");
 });
 
 test("installer backs up an existing install before overwriting", () => {
@@ -179,14 +179,14 @@ test("installer stages and validates downloads before stopping the old bridge", 
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");
   const stageAt = src.indexOf("ofb-stage");
-  const retireCall = src.indexOf("\nretire_legacy_service\n");
+  const retireMatch = src.match(/\r?\nretire_legacy_service\r?\n/);
   const syntaxAt = src.indexOf("failed a syntax check");
   assert.ok(stageAt > 0, "installer must stage downloads");
-  assert.ok(retireCall > 0, "installer must retire the legacy unit");
+  assert.ok(retireMatch, "installer must retire the legacy unit");
   assert.ok(syntaxAt > 0, "installer must syntax-check the staged files");
   // Order matters: a failed download must leave the running bridge untouched.
-  assert.ok(stageAt < retireCall, "staging must happen before the old bridge is stopped");
-  assert.ok(syntaxAt < retireCall, "validation must happen before the old bridge is stopped");
+  assert.ok(stageAt < retireMatch.index, "staging must happen before the old bridge is stopped");
+  assert.ok(syntaxAt < retireMatch.index, "validation must happen before the old bridge is stopped");
 });
 
 test("installer retires the pre-2.0 unit that owns the same port", () => {
@@ -213,7 +213,11 @@ test("server refuses to start on Node without ALLOW_NODE", () => {
   }
   if (!nodeBin) {
     try {
-      nodeBin = execFileSync("sh", ["-c", "command -v node"], { encoding: "utf8" }).trim() || null;
+      const found = process.platform === "win32"
+        ? execFileSync("where", ["node"], { encoding: "utf8" })
+        : execFileSync("sh", ["-c", "command -v node"], { encoding: "utf8" });
+      // `where` can list several hits; `command -v` can carry trailing CR.
+      nodeBin = found.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || null;
     } catch {
       nodeBin = null;
     }

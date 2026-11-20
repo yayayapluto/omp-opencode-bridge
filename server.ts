@@ -1,4 +1,32 @@
 #!/usr/bin/env bun
+// Refuse Node before loading any sibling module. Node's CJS resolver cannot
+// load extensionless .ts requires, so a guard at the bottom never runs and
+// the real transport problem is masked as MODULE_NOT_FOUND.
+const ON_BUN = typeof Bun !== "undefined";
+const ALLOW_NODE = process.env.ALLOW_NODE === "1";
+if (!ON_BUN && !ALLOW_NODE) {
+  console.error(
+    [
+      "",
+      "  opencode-free-bridge requires Bun.",
+      "",
+      "  This process is Node, whose TLS transport the free-tier gate refuses:",
+      "  measured 0/6 requests answered on Node vs 6/6 on Bun, from the same IP,",
+      "  in the same minute, with byte-identical headers and body.",
+      "",
+      "  The CLI ships as a Bun binary, so only Bun reproduces its transport.",
+      "",
+      "  Install Bun:   curl -fsSL https://bun.sh/install | bash",
+      "  Then run:      bun server.ts",
+      "",
+      "  For offline work (tests, drills, inspecting /v1/models) set ALLOW_NODE=1.",
+      "  Live chat requests will still be refused with 403 by upstream.",
+      "",
+    ].join("\n")
+  );
+  process.exit(1);
+}
+
 const dns = require("dns");
 // `ipv6first` only exists from Node 22, and an unsupported order throws
 // ERR_INVALID_ARG_VALUE at module load — which kills the bridge before it
@@ -3625,41 +3653,10 @@ const server = http.createServer(handleRequest);
 
 // Only auto-start when executed directly (`bun server.ts`), so unit tests can
 // require("./server") without binding the default port or starting timers.
-// The transport fingerprint is a property of the HTTP runtime, not of this code.
-// Measured from one IP in one minute with identical headers and body: the real
-// CLI and this bridge on Bun both answer 200, while this bridge on Node and curl
-// answer 403. The CLI ships as a Bun binary, and the gate inspects its
-// ClientHello. Node therefore cannot serve live traffic, so it is refused at
-// startup rather than left running and failing every request.
-const ON_BUN = typeof Bun !== "undefined";
-const ALLOW_NODE = process.env.ALLOW_NODE === "1";
-
-function refuseNodeRuntime(): void {
-  const lines = [
-    "",
-    "  opencode-free-bridge requires Bun.",
-    "",
-    "  This process is Node, whose TLS transport the free-tier gate refuses:",
-    "  measured 0/6 requests answered on Node vs 6/6 on Bun, from the same IP,",
-    "  in the same minute, with byte-identical headers and body.",
-    "",
-    "  The CLI ships as a Bun binary, so only Bun reproduces its transport.",
-    "",
-    "  Install Bun:   curl -fsSL https://bun.sh/install | bash",
-    "  Then run:      bun server.js",
-    "",
-    "  For offline work (tests, drills, inspecting /v1/models) set ALLOW_NODE=1.",
-    "  Live chat requests will still be refused with 403 by upstream.",
-    "",
-  ];
-  console.error(lines.join("\n"));
-}
-
+// The runtime guard runs at the top of this file, before any sibling module is
+// loaded: Node cannot resolve extensionless .ts requires, so a late refusal
+// would surface as MODULE_NOT_FOUND instead of the transport explanation.
 if (require.main === module) {
-  if (!ON_BUN && !ALLOW_NODE) {
-    refuseNodeRuntime();
-    process.exit(1);
-  }
   server.listen(PORT, HOST, () => {
     console.log(`[opencode-free-bridge] v${VERSION} listening on http://${HOST}:${PORT}`);
     if (!ON_BUN) {

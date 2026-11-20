@@ -1,4 +1,23 @@
 # Changelog
+
+## [Unreleased]
+
+The mandatory checks now pass on a Windows host as well as on Linux and macOS.
+
+- `server.ts` refuses Node before loading any sibling `.ts` module. Node's CJS
+  resolver cannot resolve extensionless `.ts` requires, so the old guard at the
+  bottom of the file never ran and the failure surfaced as `MODULE_NOT_FOUND`
+  instead of the Bun transport explanation.
+- `test/install-migration.test.js` matches installer call sites with
+  line-ending-tolerant regexes and locates Node with `where` on Windows. Under
+  Git Bash, `sh -c "command -v node"` returned an MSYS path that CreateProcess
+  could not execute, leaving the child's exit status undefined.
+- `test/proxy.test.js` asserts mode `0600` only on POSIX. Windows reports `0666`
+  for every file; the credential-leak assertions still run on every platform.
+- `proxy.ts` no longer passes an absolute timestamp as a timer delay from
+  `noteExitIp()`, and `scheduleHealthWrite()` clamps delays to the 32-bit timer
+  limit. The health write is coalesced again instead of firing immediately.
+
 ## [2.6.0] — 2026-11-16
 
 The same package is now an OMP / pi plugin.

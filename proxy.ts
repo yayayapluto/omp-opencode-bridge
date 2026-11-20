@@ -565,10 +565,13 @@ function writeHealthNow(now: number = Date.now()): void {
  */
 function scheduleHealthWrite(delayMs: number = 1000): void {
   if (healthWriteTimer) return;
+  // Timers overflow above 2^31-1 ms; a bogus absolute timestamp must not turn
+  // this coalescing write into an immediate one.
+  const delay = Number.isFinite(delayMs) && delayMs >= 0 ? Math.min(delayMs, 2 ** 31 - 1) : 1000;
   healthWriteTimer = setTimeout(() => {
     healthWriteTimer = null;
     writeHealthNow();
-  }, delayMs);
+  }, delay);
   // Never hold the process open for a cache write.
   if (typeof healthWriteTimer.unref === "function") healthWriteTimer.unref();
 }
@@ -892,7 +895,7 @@ function noteExitIp(egressUrl: string | null, ip: unknown, { now = Date.now() }:
   const key = keyOf(egressUrl);
   if (exitIpByKey.get(key) === ip) return ip;
   exitIpByKey.set(key, ip);
-  scheduleHealthWrite(now);
+  scheduleHealthWrite();
   return ip;
 }
 
