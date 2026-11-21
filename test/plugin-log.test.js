@@ -65,3 +65,44 @@ test("plugin events are JSONL, redacted, and silenced by the kill switch", () =>
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("payload and content metadata are never written", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-plugin-log-payload-"));
+  const priorDir = process.env.OPENCODE_BRIDGE_STATE_DIR;
+  const priorKill = process.env.OMP_PLUGIN_LOG;
+  const payload = "DISTINCTIVE_RAW_PAYLOAD_5b7c9d";
+  const content = "DISTINCTIVE_RAW_CONTENT_8e2f4a";
+  const logFile = path.join(dir, "plugin-events.jsonl");
+
+  process.env.OPENCODE_BRIDGE_STATE_DIR = dir;
+  delete process.env.OMP_PLUGIN_LOG;
+  try {
+    const log = createLogger({ plugin: "omp-opencode-bridge", version: "2.7.0" });
+    log.info("model_output_seen", {
+      payload: { raw: payload },
+      Content: content,
+      completion: payload,
+      text: content,
+      reasoning: payload,
+      safeCount: 2,
+    });
+
+    const raw = fs.readFileSync(logFile, "utf8");
+    assert.ok(!raw.includes(payload), "payload leaked");
+    assert.ok(!raw.includes(content), "content leaked");
+
+    const entry = JSON.parse(raw.trimEnd());
+    assert.equal(entry.payload, undefined);
+    assert.equal(entry.Content, undefined);
+    assert.equal(entry.completion, undefined);
+    assert.equal(entry.text, undefined);
+    assert.equal(entry.reasoning, undefined);
+    assert.equal(entry.safeCount, 2);
+  } finally {
+    if (priorDir === undefined) delete process.env.OPENCODE_BRIDGE_STATE_DIR;
+    else process.env.OPENCODE_BRIDGE_STATE_DIR = priorDir;
+    if (priorKill === undefined) delete process.env.OMP_PLUGIN_LOG;
+    else process.env.OMP_PLUGIN_LOG = priorKill;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
