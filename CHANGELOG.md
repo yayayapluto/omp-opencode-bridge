@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.7.0] - 2026-11-21
+
+The plugin now writes a sanitized local event log next to its existing state files.
+
+- **New `src/log.ts`:** append-only JSONL at `<state dir>/plugin-events.jsonl` with
+  `ts`, `level`, `event`, `plugin`, `version` and safe metadata. `OMP_PLUGIN_LOG=0`
+  disables file logging; console output stays unchanged. Writes are best effort
+  and never throw into plugin control flow.
+- **Redaction:** keys matching `token`, `secret`, `password`, `authorization`,
+  `cookie`, `api[-_]?key` or `credential`, plus prompt, output, body, header and
+  stack fields, are dropped. Strings are capped at 200 characters, URL queries
+  are stripped, and inline secrets are replaced before write.
+- **Coverage:** `server.ts` and `src/index.ts` log lifecycle, bridge, model,
+  egress and gate events with counts, statuses and safe errors. Raw bridge
+  stdout/stderr still goes to `omp-plugin.log`.
+- **Tests:** `test/plugin-log.test.js` asserts JSONL shape, redaction, query
+  stripping, truncation and the kill switch.
+
 ## [Unreleased]
 
 The mandatory checks now pass on a Windows host as well as on Linux and macOS.

@@ -80,7 +80,7 @@ bun --version
 
 ### Step 2 — Install the plugin into OMP
 
-From npm (published, current `2.6.0`):
+From npm (published, current `2.7.0`):
 
 ```bash
 omp plugin install omp-opencode-bridge
@@ -97,6 +97,7 @@ omp plugin install .
 Either way the extension is `src/index.ts` (declared under `"pi": { "extensions": ["./src/index.ts"] }`).
 On session start it reuses a bridge already listening on the port, otherwise spawns
 `bun server.ts` from the package root, detached, logging to `~/.opencode-free-bridge/omp-plugin.log`.
+Sanitized plugin events are appended to `~/.opencode-free-bridge/plugin-events.jsonl`.
 
 Plugin settings:
 
@@ -105,6 +106,7 @@ Plugin settings:
 | `OPENCODE_BRIDGE_PORT` | `20129` | Port the plugin probes and starts the bridge on |
 | `OPENCODE_BRIDGE_BUN` | `bun` | Bun binary used to spawn `server.ts` |
 | `OPENCODE_BRIDGE_STATE_DIR` | `~/.opencode-free-bridge` | State, log and model-cache directory |
+| `OMP_PLUGIN_LOG` | unset | Set to `0` to disable plugin event logging. Console output is unaffected |
 
 ### Step 3 — Verify it loaded
 
@@ -124,7 +126,7 @@ bun verify.ts --quick
 opencode-free-bridge — self check
 http://127.0.0.1:20129
 
-  OK  bridge v2.6.0, 11 free models discovered
+  OK  bridge v2.7.0, 11 free models discovered
 
   egress: direct (this machine's IP)
 
@@ -322,6 +324,7 @@ Environment (read in `server.ts`, `identity.ts`, `proxy.ts`, `token-budget.ts`, 
 | `PANEL_ALLOWED_HOSTS` | unset | Extra `Host` names accepted by the panel and `/api/proxy` |
 | `AUTO_UPDATE` | `1` | Check for bridge updates every 6 h (skipped in a `.git` checkout) |
 | `ALLOW_NODE` | unset | `1` bypasses the Bun runtime guard (offline tests only) |
+| `OMP_PLUGIN_LOG` | unset | `0` disables all plugin file logging in the process |
 
 State and caches under `~/.opencode-free-bridge` (or `OPENCODE_BRIDGE_STATE_DIR`):
 
@@ -333,6 +336,7 @@ State and caches under `~/.opencode-free-bridge` (or `OPENCODE_BRIDGE_STATE_DIR`
 | `omp-plugin.json` | `src/index.ts` | Port and pid of the bridge the plugin spawned |
 | `omp-models.json` | `src/index.ts` | Last discovered model list, used before the bridge starts |
 | `omp-plugin.log` | spawned bridge | Bridge stdout/stderr when started by the plugin |
+| `plugin-events.jsonl` | `src/log.ts` | Sanitized JSONL plugin events (counts, statuses, safe errors) |
 
 Ports: `20129` (bridge + panel). `egress-proxy.ts` listens on `PORT` (default `8888`) when run as a pool
 member. `/healthz` on that proxy is unauthenticated and reports only connection count and uptime.
@@ -358,6 +362,7 @@ omp-opencode-bridge/
 ├── tunnel-doctor.sh           # diagnose/reap stale ssh -R forwarders
 ├── install.sh                 # Bun discovery, staged install, systemd/launchd unit
 ├── src/index.ts               # OMP/pi extension: provider registration + /opencode-free
+├── src/log.ts                 # shared JSONL logger: redaction, state dir, kill switch
 ├── test/                      # bun test suites (server, identity, proxy, retry, drills, …)
 ├── Dockerfile, docker-compose.yaml
 └── package.json
@@ -411,7 +416,7 @@ CI (`.github/workflows/ci.yml`) runs `bun test test/*.test.js`, `bun gate-drill.
 | `verify.ts` exits `2` | Bridge healthy, TLS fine, upstream refuses this IP | Same answer as the official CLI from this IP; change egress or wait |
 | `verify.ts` exits `1` | Bridge unreachable, running on Node, or TLS drift | `curl /health`, check `bun transport-fingerprint.ts --check` |
 | `omp` starts but `opencode-free` has no models | Bridge never came up; only the cached list was registered | `/opencode-free start`, then `/opencode-free logs` |
-| `opencode-free-bridge did not answer /health … within 20000ms` | Spawned Bun failed (missing binary, port busy, bad cwd) | Set `OPENCODE_BRIDGE_BUN` to an absolute bun path; read `~/.opencode-free-bridge/omp-plugin.log` |
+| `omp-plugin.log` is noisy or the event log is missing | Raw bridge output lives in `omp-plugin.log`; plugin events live in `plugin-events.jsonl` | Set `OMP_PLUGIN_LOG=0` to silence file logging; check `OPENCODE_BRIDGE_STATE_DIR` |
 | Panel refuses a proxy URL with `UnsupportedProxyProtocol` | SOCKS5 is not accepted by Bun's fetch | Use `http://` or `https://` (`http://user:pass@host:port`) |
 | Panel answers `403`, `Host` rejected | Request came from a non-loopback name or a rebinding attempt | Add the proxy's name to `PANEL_ALLOWED_HOSTS` |
 | `remote port forwarding failed for listen port 20136` | Stale `ssh -R` listener on the receiving host | `./tunnel-doctor.sh --reap`, and shorten `ClientAliveInterval` on the receiver |
@@ -432,6 +437,10 @@ CI (`.github/workflows/ci.yml`) runs `bun test test/*.test.js`, `bun gate-drill.
 - **The self-updater writes code.** With `AUTO_UPDATE=1` it downloads from this repository and swaps files
   in the install directory after syntax-checking them; set `AUTO_UPDATE=0` in containers or where the
   install directory must stay immutable.
+- **Sanitized plugin logs.** `plugin-events.jsonl` contains only metadata such as event names, model ids,
+  counts, statuses and safe error messages. Tokens, prompts, model output, profile text,
+  CLI output bodies, headers, stacks and URLs with query strings are dropped or redacted before writing.
+  File writes are best effort and fail silently; set `OMP_PLUGIN_LOG=0` to disable them.
 - **Third-party prompts.** `identity.ts` reproduces OpenCode's tool descriptions and schema fields; see
   [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
 

@@ -356,6 +356,7 @@ test("a server.ts that requires a module the old updater never fetched still boo
       fs.copyFileSync(path.join(__dirname, "..", f), path.join(tmp, f));
     }
     fs.copyFileSync(path.join(__dirname, "..", "package.json"), path.join(tmp, "package.json"));
+    fs.cpSync(path.join(__dirname, "..", "src"), path.join(tmp, "src"), { recursive: true });
     assert.equal(fs.existsSync(path.join(tmp, "proxy.ts")), false);
     // `proxy.ts` and `panel.ts` are deliberately absent from this directory.
     const out = execFileSync(

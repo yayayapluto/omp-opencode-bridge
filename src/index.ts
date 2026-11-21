@@ -27,6 +27,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createLogger } from "./log";
+
 
 const EXTENSION_NAME = "opencode-free";
 const HOST = "127.0.0.1";
@@ -35,6 +37,15 @@ const START_TIMEOUT_MS = 20_000;
 
 // Where the installed package keeps the bridge. `src/index.ts` → package root.
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const VERSION = (() => {
+	try {
+		return JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, "package.json"), "utf8")).version;
+	} catch {
+		return "unknown";
+	}
+})();
+const log = createLogger({ plugin: "omp-opencode-bridge", version: VERSION });
+
 
 const STATE_DIR = process.env.OPENCODE_BRIDGE_STATE_DIR || path.join(os.homedir(), ".opencode-free-bridge");
 const STATE_FILE = path.join(STATE_DIR, "omp-plugin.json");
@@ -193,20 +204,22 @@ async function startBridge(port: number): Promise<BridgeState> {
 		if (health) {
 			const state: BridgeState = { port, pid: child.pid, startedAt: Date.now() };
 			writeState(state);
+			log.info("bridge_started", { port, pid: child.pid });
 			return state;
 		}
 		if (child.pid && !pidAlive(child.pid)) break;
 		await new Promise((r) => setTimeout(r, 250));
 	}
-	throw new Error(
-		`opencode-free-bridge did not answer /health on ${HOST}:${port} within ${START_TIMEOUT_MS}ms — inspect ${LOG_FILE}`
-	);
+	const message = `opencode-free-bridge did not answer /health on ${HOST}:${port} within ${START_TIMEOUT_MS}ms`;
+	log.error("bridge_start_failed", { port, timeoutMs: START_TIMEOUT_MS, error: message });
+	throw new Error(`${message} — inspect ${LOG_FILE}`);
 }
 
 /** Reuse a healthy bridge, else start one. */
 async function ensureBridge(port: number): Promise<BridgeState> {
 	const state = readState();
 	if (state && (await healthz(state.port))) {
+		log.info("bridge_reused", { port: state.port });
 		return { ...state, port: state.port };
 	}
 	if (await healthz(port)) return { port };
@@ -215,11 +228,16 @@ async function ensureBridge(port: number): Promise<BridgeState> {
 
 function stopBridge(): boolean {
 	const state = readState();
-	if (!state?.pid || !pidAlive(state.pid)) return false;
+	if (!state?.pid || !pidAlive(state.pid)) {
+		log.info("bridge_stop_skipped", { port: state?.port || port });
+		return false;
+	}
 	try {
 		process.kill(state.pid);
+		log.info("bridge_stopped", { port: state.port, pid: state.pid });
 		return true;
-	} catch {
+	} catch (err) {
+		log.warn("bridge_stop_failed", { port: state.port, error: (err as Error).message });
 		return false;
 	}
 }
@@ -249,10 +267,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					models = fresh;
 					saveModelsCache(fresh);
 				}
+				log.info("models_refreshed", { count: fresh.length, port: activePort });
 				return fresh;
 			},
 		});
 		pi.setStatus?.(EXTENSION_NAME, `${list.length} free models via ${HOST}:${activePort}`);
+		log.info("provider_registered", { models: list.length, port: activePort });
 	};
 
 	// Register with the cached list first so the provider exists even when the
@@ -268,12 +288,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			models = fresh;
 			saveModelsCache(fresh);
 		}
+		log.info("models_refreshed", { count: fresh.length, port });
 		register(models, port);
 	};
 
 	try {
 		await refresh();
 	} catch (err) {
+		log.error("extension_init_failed", { error: (err as Error).message });
 		pi.ui.notify(`${EXTENSION_NAME}: ${(err as Error).message}`, "warning");
 	}
 
@@ -288,10 +310,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			const sub = String(args || "").trim().split(/\s+/)[0] || "status";
 			const notify = (message: string, level = "info") =>
 				(ctx?.ui?.notify ? ctx.ui.notify(message, level) : pi.ui.notify(message, level));
-
+			log.info("command_invoked", { action: sub });
 			switch (sub) {
 				case "status": {
 					const health = await healthz(port);
+					log.info("bridge_health_checked", { action: "status", online: Boolean(health), runtime: health ? String(health.runtime || "unknown") : undefined, version: health ? String(health.version || "?") : undefined });
 					notify(
 						`${EXTENSION_NAME}: bridge ${health ? `online ${HOST}:${port}` : "offline"} · models=${models.length} · ` +
 							`runtime=${String(health?.runtime || "unknown")} · version=${String(health?.version || "?")}`
@@ -318,7 +341,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					break;
 				}
 				case "stop": {
-					notify(stopBridge() ? "bridge stopped" : "no bridge started by the plugin (it may be running elsewhere)", "warning");
+					const stopped = stopBridge();
+					notify(stopped ? "bridge stopped" : "no bridge started by the plugin (it may be running elsewhere)", "warning");
 					break;
 				}
 				case "restart": {
@@ -327,11 +351,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					const state = await ensureBridge(port);
 					port = state.port;
 					await refresh();
-					notify(`bridge restarted on ${HOST}:${port}`);
+					log.info("bridge_restarted", { port });
 					break;
 				}
 				case "health": {
 					const health = await healthz(port);
+					log.info("bridge_health_checked", { action: "health", online: Boolean(health), runtime: health ? String(health.runtime || "unknown") : undefined, version: health ? String(health.version || "?") : undefined });
 					notify(health ? JSON.stringify(health, null, 2).slice(0, 4000) : `no /health answer on ${HOST}:${port}`, health ? "info" : "warning");
 					break;
 				}
