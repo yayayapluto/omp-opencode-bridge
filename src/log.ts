@@ -3,7 +3,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const SENSITIVE_KEY = /token|secret|password|authorization|cookie|api[-_]?key|credential/i;
-const NEVER_LOG_KEY = /prompt|messages|output|response|body|headers|stack|profile/i;
+const NEVER_LOG_KEY = /prompt|messages|output|response|body|headers|stack|profile|payload|text|content|completion|reasoning/i;
 const RESERVED_KEY = /^(ts|level|event|plugin)$/;
 const URL_WITH_QUERY = /https?:\/\/\S+/gi;
 const BEARER_VALUE = /\b(bearer\s+)\S+/gi;
