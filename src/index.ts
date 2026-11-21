@@ -351,8 +351,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					const state = await ensureBridge(port);
 					port = state.port;
 					await refresh();
+					notify(`bridge restarted on ${HOST}:${port}`);
 					log.info("bridge_restarted", { port });
-					break;
 				}
 				case "health": {
 					const health = await healthz(port);

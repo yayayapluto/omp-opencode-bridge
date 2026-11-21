@@ -399,6 +399,8 @@ async function repairMissingModules(dir: string = __dirname): Promise<RepairResu
       const syntax = moduleSyntaxError(text);
       if (syntax) throw new Error(syntax);
       const tmp = path.join(dir, `.${file}.repair.${process.pid}`);
+      fs.mkdirSync(path.dirname(tmp), { recursive: true });
+      fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
       fs.writeFileSync(tmp, text, "utf8");
       fs.renameSync(tmp, path.join(dir, file));
       repaired.push(file);
@@ -478,6 +480,7 @@ const UPDATE_BASE_URL =
   "https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main";
 const AUTO_UPDATE = process.env.AUTO_UPDATE !== "0" && process.env.AUTO_UPDATE !== "false";
 const UPDATE_FILES = [
+  "src/log.ts",
   "package.json",
   "identity.ts",
   "token-budget.ts",
@@ -589,6 +592,7 @@ async function checkAndApplyUpdate(): Promise<UpdateResult> {
           if (!/^#!.*\b(ba)?sh\b/.test(text)) throw new Error(`${file} is not a shell script`);
         }
         const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
+        fs.mkdirSync(path.dirname(tmpPath), { recursive: true });
         fs.writeFileSync(tmpPath, text, "utf8");
         if (file.endsWith(".sh")) {
           let parsed = true;
@@ -634,6 +638,7 @@ async function checkAndApplyUpdate(): Promise<UpdateResult> {
           const reqSyntax = moduleSyntaxError(text);
           if (reqSyntax) throw new Error(`syntax check failed for required module ${file}: ${reqSyntax}`);
           const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
+          fs.mkdirSync(path.dirname(tmpPath), { recursive: true });
           fs.writeFileSync(tmpPath, text, "utf8");
           tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
           declared.add(file);
@@ -641,7 +646,10 @@ async function checkAndApplyUpdate(): Promise<UpdateResult> {
         }
       }
 
-      for (const { tmpPath, targetPath } of tmpFiles) fs.renameSync(tmpPath, targetPath);
+      for (const { tmpPath, targetPath } of tmpFiles) {
+        fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+        fs.renameSync(tmpPath, targetPath);
+      }
       logConsole(
         "info",
         "bridge_self_updated",

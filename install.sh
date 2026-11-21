@@ -369,6 +369,7 @@ say "Installing into $BINDIR"
 fetch() {
   local file="$1"
   local tmp="$STAGE/$file"
+  mkdir -p "$(dirname "$tmp")"
   if [ "$SOURCE" = "local" ]; then
     [ -f "$SRC_DIR/$file" ] || die "$file is missing from the local checkout ($SRC_DIR)"
     cp -p "$SRC_DIR/$file" "$tmp"
@@ -395,6 +396,7 @@ fetch() {
 
 
 fetch package.json
+fetch src/log.ts
 fetch server.ts
 fetch identity.ts
 fetch token-budget.ts
@@ -426,7 +428,7 @@ syntax_check() {
   ' "$1"
 }
 
-for ts in server.ts identity.ts token-budget.ts verify.ts gate-drill.ts transport-fingerprint.ts proxy.ts panel.ts egress-proxy.ts anthropic.ts; do
+for ts in server.ts src/log.ts identity.ts token-budget.ts verify.ts gate-drill.ts transport-fingerprint.ts proxy.ts panel.ts egress-proxy.ts anthropic.ts; do
   syntax_check "$STAGE/$ts" >/dev/null 2>&1 || die "$ts failed a syntax check; the running bridge was left untouched"
 done
 for json in package.json transport-baseline.json; do
@@ -457,7 +459,8 @@ if [ -n "$(port_holder)" ]; then
   die "cannot bind port $PORT"
 fi
 
-for file in package.json server.ts identity.ts token-budget.ts verify.ts gate-drill.ts transport-fingerprint.ts transport-baseline.json tunnel-doctor.sh proxy.ts panel.ts egress-proxy.ts anthropic.ts THIRD_PARTY_NOTICES.md; do
+mkdir -p "$BINDIR/src"
+for file in package.json server.ts src/log.ts identity.ts token-budget.ts verify.ts gate-drill.ts transport-fingerprint.ts transport-baseline.json tunnel-doctor.sh proxy.ts panel.ts egress-proxy.ts anthropic.ts THIRD_PARTY_NOTICES.md; do
   [ -f "$STAGE/$file" ] && mv -f "$STAGE/$file" "$BINDIR/$file"
 done
 chmod +x "$BINDIR/server.ts" "$BINDIR/identity.ts" "$BINDIR/verify.ts" "$BINDIR/gate-drill.ts" "$BINDIR/transport-fingerprint.ts" "$BINDIR/tunnel-doctor.sh" "$BINDIR/egress-proxy.ts" 2>/dev/null || true

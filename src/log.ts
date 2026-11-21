@@ -4,7 +4,7 @@ const path = require("node:path");
 
 const SENSITIVE_KEY = /token|secret|password|authorization|cookie|api[-_]?key|credential/i;
 const NEVER_LOG_KEY = /prompt|messages|output|response|body|headers|stack|profile/i;
-const RESERVED_KEY = /^(ts|level|event|plugin|version)$/;
+const RESERVED_KEY = /^(ts|level|event|plugin)$/;
 const URL_WITH_QUERY = /https?:\/\/\S+/gi;
 const BEARER_VALUE = /\b(bearer\s+)\S+/gi;
 const INLINE_SECRET = /\b(token|secret|password|authorization|cookie|api[-_]?key|credential)\s*[:=]\s*[^\s,;]+/gi;
@@ -12,7 +12,7 @@ const MAX_STRING = 200;
 
 function safeString(value: unknown): string {
   let text = String(value);
-  text = text.replace(URL_WITH_QUERY, (url) => url.split(/[?#]/)[0]);
+  text = text.replace(URL_WITH_QUERY, (url) => url.replace(/\/\/[^/?#\s@]+@/, "//[redacted]@").split(/[?#]/)[0]);
   text = text.replace(BEARER_VALUE, "$1[redacted]");
   text = text.replace(INLINE_SECRET, "$1=[redacted]");
   return text.length > MAX_STRING ? text.slice(0, MAX_STRING) : text;
@@ -55,7 +55,14 @@ function createLogger(config: { plugin: string; version: string }) {
         version,
       };
       const safe = redact(metadata);
-      if (safe && typeof safe === "object") Object.assign(entry, safe);
+      if (safe && typeof safe === "object") {
+        for (const [key, value] of Object.entries(safe)) {
+          // A metadata `version` describes the remote side; keep the plugin
+          // version in the reserved field.
+          if (key === "version") entry.upstreamVersion = value;
+          else entry[key] = value;
+        }
+      }
       fs.mkdirSync(stateDir(), { recursive: true });
       fs.appendFileSync(path.join(stateDir(), "plugin-events.jsonl"), JSON.stringify(entry) + "\n");
     } catch {

@@ -11,6 +11,7 @@ test("plugin events are JSONL, redacted, and silenced by the kill switch", () =>
   const priorKill = process.env.OMP_PLUGIN_LOG;
   const secret = "sk-DISTINCTIVE-TEST-TOKEN-9f4a2b";
   const prompt = "DISTINCTIVE_PROMPT_TEXT_7c1d8e";
+  const userinfo = "DISTINCTIVE_USER:DISTINCTIVE_PASS";
   const logFile = path.join(dir, "plugin-events.jsonl");
 
   process.env.OPENCODE_BRIDGE_STATE_DIR = dir;
@@ -22,7 +23,8 @@ test("plugin events are JSONL, redacted, and silenced by the kill switch", () =>
       apiKey: secret,
       nested: { Authorization: `Bearer ${secret}`, model: "mimo-free" },
       prompt,
-      url: `https://example.com/v1/chat?token=${secret}#fragment`,
+      url: `https://${userinfo}@example.com/v1/chat?token=${secret}#fragment`,
+      version: "2.6.9",
       stack: "Error: stack must never be logged",
       long: "x".repeat(250),
     });
@@ -32,6 +34,8 @@ test("plugin events are JSONL, redacted, and silenced by the kill switch", () =>
     assert.ok(!raw.includes(prompt), "prompt leaked");
     assert.ok(!raw.includes("stack must never be logged"), "stack leaked");
     assert.ok(!raw.includes("?token="), "query string leaked");
+    assert.ok(!raw.includes("DISTINCTIVE_USER"), "URL user leaked");
+    assert.ok(!raw.includes("DISTINCTIVE_PASS"), "URL password leaked");
 
     const lines = raw.trimEnd().split(/\r?\n/);
     assert.equal(lines.length, 1);
@@ -41,6 +45,7 @@ test("plugin events are JSONL, redacted, and silenced by the kill switch", () =>
     assert.equal(entry.event, "models_refreshed");
     assert.equal(entry.plugin, "omp-opencode-bridge");
     assert.equal(entry.version, "2.7.0");
+    assert.equal(entry.upstreamVersion, "2.6.9");
     assert.equal(entry.count, 3);
     assert.equal(entry.nested.model, "mimo-free");
     assert.equal(entry.apiKey, undefined);
