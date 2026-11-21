@@ -26,7 +26,22 @@ if (!ON_BUN && !ALLOW_NODE) {
   );
   process.exit(1);
 }
+let log: { write(level: string, event: string, metadata?: unknown): void } = { write() {} };
+let VERSION = "1.5.0";
+try {
+  VERSION = require("./package.json").version || VERSION;
+  const { createLogger } = require("./src/log");
+  log = createLogger({ plugin: "omp-opencode-bridge", version: VERSION });
+} catch {}
+function logConsole(level: string, event: string, metadata: unknown, ...args: unknown[]): void {
+  if (level === "error") console.error(...args);
+  else if (level === "warn") console.warn(...args);
+  else console.log(...args);
+  log.write(level, event, metadata);
+}
 
+
+const crypto = require("crypto");
 const dns = require("dns");
 // `ipv6first` only exists from Node 22, and an unsupported order throws
 // ERR_INVALID_ARG_VALUE at module load — which kills the bridge before it
@@ -37,7 +52,10 @@ const DNS_RESULT_ORDER = (() => {
     try {
       dns.setDefaultResultOrder(order);
       if (order !== wanted) {
-        console.warn(
+        logConsole(
+          "warn",
+          "dns_order_fallback",
+          { requested: wanted, applied: order, node: process.versions.node },
           `[opencode-free-bridge] DNS_RESULT_ORDER=${wanted} is not supported by this Node (${process.versions.node}); using ${order}`
         );
       }
@@ -47,11 +65,6 @@ const DNS_RESULT_ORDER = (() => {
   return null;
 })();
 const http = require("http");
-const crypto = require("crypto");
-let VERSION = "1.5.0";
-try {
-  VERSION = require("./package.json").version || VERSION;
-} catch {}
 const { effectiveMaxTokens } = require("./token-budget");
 const { handleAnthropicMessages, handleCountTokens } = require("./anthropic");
 // TypeScript type declarations only — erased at load. `proxy` and `panel` are
@@ -346,7 +359,7 @@ function localRequires(source: unknown): string[] {
     .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
   // `require("./x")` and the tolerant `loadLocalModule("x", …)` loader both
   // name a file that must be present for this server to work.
-  for (const re of [/\brequire\(\s*["']\.\/([A-Za-z0-9._-]+)["']\s*\)/g, /\bloadLocalModule\(\s*["']([A-Za-z0-9._-]+)["']/g]) {
+  for (const re of [/\brequire\(\s*["']\.\/([A-Za-z0-9._/-]+)["']\s*\)/g, /\bloadLocalModule\(\s*["']([A-Za-z0-9._-]+)["']/g]) {
     let match;
     while ((match = re.exec(text))) {
       if (match[1].endsWith(".json")) continue;
@@ -386,6 +399,8 @@ async function repairMissingModules(dir: string = __dirname): Promise<RepairResu
       const syntax = moduleSyntaxError(text);
       if (syntax) throw new Error(syntax);
       const tmp = path.join(dir, `.${file}.repair.${process.pid}`);
+      fs.mkdirSync(path.dirname(tmp), { recursive: true });
+      fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
       fs.writeFileSync(tmp, text, "utf8");
       fs.renameSync(tmp, path.join(dir, file));
       repaired.push(file);
@@ -396,12 +411,15 @@ async function repairMissingModules(dir: string = __dirname): Promise<RepairResu
   if (repaired.length && path.resolve(dir) === path.resolve(__dirname)) {
     proxy = loadLocalModule("proxy", PROXY_FALLBACK) as ProxyApi;
     panel = loadLocalModule("panel", PANEL_FALLBACK) as PanelApi;
-    console.log(`[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
+    logConsole("info", "modules_repaired", { modules: repaired }, `[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
   } else if (repaired.length) {
-    console.log(`[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
+    logConsole("info", "modules_repaired", { modules: repaired }, `[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
   }
   if (failed.length) {
-    console.warn(
+    logConsole(
+      "warn",
+      "module_repair_failed",
+      { count: failed.length },
       `[opencode-free-bridge] Could not repair ${failed.join(", ")}; ` +
         "running with direct egress. Re-run install.sh to fix this install."
     );
@@ -462,6 +480,7 @@ const UPDATE_BASE_URL =
   "https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main";
 const AUTO_UPDATE = process.env.AUTO_UPDATE !== "0" && process.env.AUTO_UPDATE !== "false";
 const UPDATE_FILES = [
+  "src/log.ts",
   "package.json",
   "identity.ts",
   "token-budget.ts",
@@ -573,6 +592,7 @@ async function checkAndApplyUpdate(): Promise<UpdateResult> {
           if (!/^#!.*\b(ba)?sh\b/.test(text)) throw new Error(`${file} is not a shell script`);
         }
         const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
+        fs.mkdirSync(path.dirname(tmpPath), { recursive: true });
         fs.writeFileSync(tmpPath, text, "utf8");
         if (file.endsWith(".sh")) {
           let parsed = true;
@@ -618,15 +638,22 @@ async function checkAndApplyUpdate(): Promise<UpdateResult> {
           const reqSyntax = moduleSyntaxError(text);
           if (reqSyntax) throw new Error(`syntax check failed for required module ${file}: ${reqSyntax}`);
           const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
+          fs.mkdirSync(path.dirname(tmpPath), { recursive: true });
           fs.writeFileSync(tmpPath, text, "utf8");
           tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
           declared.add(file);
-          console.log(`[opencode-free-bridge] Staged newly required module ${file}`);
+          logConsole("info", "module_staged", { module: file }, `[opencode-free-bridge] Staged newly required module ${file}`);
         }
       }
 
-      for (const { tmpPath, targetPath } of tmpFiles) fs.renameSync(tmpPath, targetPath);
-      console.log(
+      for (const { tmpPath, targetPath } of tmpFiles) {
+        fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+        fs.renameSync(tmpPath, targetPath);
+      }
+      logConsole(
+        "info",
+        "bridge_self_updated",
+        { from: VERSION, to: remoteVersion },
         `[opencode-free-bridge] Self-updated ${VERSION} → ${remoteVersion}; exiting for service restart.`
       );
       server.close(() => process.exit(0));
@@ -638,7 +665,7 @@ async function checkAndApplyUpdate(): Promise<UpdateResult> {
           if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
         } catch {}
       }
-      console.warn(`[opencode-free-bridge] Self-update skipped: ${err.message}`);
+      logConsole("warn", "self_update_skipped", { error: err.message }, `[opencode-free-bridge] Self-update skipped: ${err.message}`);
       return { updated: false, error: err.message };
     } finally {
       updateInFlight = null;
@@ -746,7 +773,10 @@ async function egressFetch(url: string, init: Record<string, unknown>, state: Eg
     const next = proxy.pick({ exclude: state.egressUrl });
     if (!next.url || next.url === state.egressUrl) throw err;
 
-    console.warn(
+    logConsole(
+      "warn",
+      "egress_failover",
+      { from: proxy.displayHost(state.egressUrl) || "direct", to: proxy.displayHost(next.url) || "direct", error: err.message },
       `[opencode-free-bridge] Egress ${
         proxy.displayHost(state.egressUrl) || "direct"
       } unreachable (${err.message}); retrying through ${proxy.displayHost(next.url) || "direct"}`
@@ -825,7 +855,10 @@ function gateSafeUserAgent(): string {
     return String(override).trim();
   }
   if (override) {
-    console.warn(
+    logConsole(
+      "warn",
+      "user_agent_override_invalid",
+      {},
       "[opencode-free-bridge] OPENCODE_USER_AGENT does not match the shape the free-tier gate accepts " +
         "(opencode/<channel>/<semver>/<name>); using the derived identity instead"
     );
@@ -1018,7 +1051,10 @@ async function discoverModels(): Promise<void> {
     // ruling (or, before the first catalog read, to the `-free` suffix).
     const promoted = identity.applyGatewayPricing(items);
     if (promoted.length > 0) {
-      console.log(
+      logConsole(
+        "info",
+        "catalog_pricing_reruled",
+        { models: promoted.slice(0, 6), count: promoted.length },
         `[opencode-free-bridge] Gateway price list re-ruled: ${promoted.slice(0, 6).join(", ")}${promoted.length > 6 ? ` (+${promoted.length - 6})` : ""}`
       );
     }
@@ -1060,11 +1096,11 @@ async function discoverModels(): Promise<void> {
       activeModels = freeItems;
       rebuildDiscoveryPayloads();
       lastDiscoveryTime = Date.now();
-      console.log(`[opencode-free-bridge] Auto-discovered ${activeModels.length} free models from upstream gateway.`);
+      logConsole("info", "models_discovered", { count: activeModels.length }, `[opencode-free-bridge] Auto-discovered ${activeModels.length} free models from upstream gateway.`);
       return;
     }
     } catch (err) {
-      console.warn(`[opencode-free-bridge] Auto-discovery warning: ${err.message}. Model list stays empty until upstream answers.`);
+      logConsole("warn", "model_discovery_warning", { error: err.message }, `[opencode-free-bridge] Auto-discovery warning: ${err.message}. Model list stays empty until upstream answers.`);
     }
   })();
   try {
@@ -1966,7 +2002,10 @@ function respondIpAbuse(res: ServerResponseLike, status: number, errType: unknow
     message: errMsg,
     model,
   };
-  console.warn(
+  logConsole(
+    "warn",
+    "ip_abuse_block",
+    { status, model, errType, hasLogId: Boolean(logId) },
     `[opencode-free-bridge] Upstream IP-abuse block (${status}): ${errMsg} — not refreshing or retrying; the gateway keys this to this network's IP, so no identity change can clear it` +
       (logId ? ` [x-opencode-log-id: ${logId}]` : "")
   );
@@ -2099,7 +2138,10 @@ async function handleProxyApi(req: IncomingRequestLike, res: ServerResponseLike,
       : payload.pool;
     const result = proxy.setPool(spec);
     if (!result.ok) return send(400, { error: result.error });
-    console.log(
+    logConsole(
+      "info",
+      "egress_pool_updated",
+      { enabled: result.pool.enabled, size: result.pool.size, strategy: result.pool.strategy },
       `[opencode-free-bridge] Egress pool: ${result.pool.enabled}/${result.pool.size} aktif, strategi ${result.pool.strategy}`
     );
     return send(200, result);
@@ -2140,7 +2182,10 @@ async function handleProxyApi(req: IncomingRequestLike, res: ServerResponseLike,
   if (typeof payload.url === "string") {
     const result = proxy.setProxyUrl(payload.url);
     if (!result.ok) return send(400, { error: result.error });
-    console.log(
+    logConsole(
+      "info",
+      "egress_updated",
+      { mode: result.mode },
       `[opencode-free-bridge] Egress ${result.mode === "proxy" ? `via proxy ${result.proxy}` : "direct"}`
     );
     return send(200, result);
@@ -2216,10 +2261,10 @@ function readRequestBody(req: IncomingRequestLike, maxBytes: number = MAX_BODY_B
 // --- HTTP Server ---
 function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void {
   req.on("error", (err) => {
-    console.warn("[opencode-free-bridge] request stream error:", err.message);
+    logConsole("warn", "request_stream_error", { error: err.message }, "[opencode-free-bridge] request stream error:", err.message);
   });
   res.on("error", (err) => {
-    console.warn("[opencode-free-bridge] response stream error:", err.message);
+    logConsole("warn", "response_stream_error", { error: err.message }, "[opencode-free-bridge] response stream error:", err.message);
   });
 
   const reqOrigin = req.headers?.origin || "";
@@ -2664,7 +2709,10 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
             liveEndpoints = resolveEndpoints(targetModel);
             const derivedUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
             if (derivedUrl && derivedUrl !== staleUrl) {
-              console.warn(
+              logConsole(
+                "warn",
+                "endpoint_moved",
+                { status: upstreamRes.status },
                 `[opencode-free-bridge] Upstream endpoint moved (${upstreamRes.status}): ${staleUrl} → ${derivedUrl}; retrying once`
               );
               upstreamUrl = derivedUrl;
@@ -2723,7 +2771,10 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
               // stamped with a fresh 429. Nothing healthy is left to try, so
               // fail fast and let Retry-After carry the wait instead.
               if (next.cooling) {
-                console.warn(
+                logConsole(
+                  "warn",
+                  "egress_pool_exhausted",
+                  { enabled: poolState.enabled },
                   `[opencode-free-bridge] Pool has no ready egress (${poolState.enabled} enabled, all cooling); not walking it`
                 );
                 break;
@@ -2732,7 +2783,10 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
               if (tried.has(key)) break;
               tried.add(key);
 
-              console.warn(
+              logConsole(
+                "warn",
+                "egress_allowance_failover",
+                { attempt: tried.size, enabled: poolState.enabled },
                 `[opencode-free-bridge] Egress ${
                   proxy.displayHost(egressState.egressUrl) || "direct"
                 } is out of allowance (429); trying ${
@@ -2760,7 +2814,10 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
             }
 
             if (upstreamRes.status === 429) {
-              console.warn(
+              logConsole(
+                "warn",
+                "egress_pool_declined",
+                { count: tried.size },
                 `[opencode-free-bridge] All ${tried.size} pooled egress(es) refused this request; exhausted the pool, returning 429`
               );
             }
@@ -2781,7 +2838,10 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
           } catch {}
           const retry5xxSid = regenerateSessionId(req, body, sessionId);
           const retry5xxHeaders = buildUpstreamHeaders(req, retry5xxSid);
-          console.warn(
+          logConsole(
+            "warn",
+            "upstream_5xx_retry",
+            { status: first5xx, hasLogId: Boolean(firstLogId) },
             `[opencode-free-bridge] Upstream returned ${first5xx}` +
               (firstLogId ? ` [x-opencode-log-id: ${firstLogId}]` : "") +
               `; retrying once with fresh session`
@@ -2866,7 +2926,10 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
                 message: rawMsg,
                 model: targetModel,
               };
-              console.warn(
+              logConsole(
+                "warn",
+                "upstream_server_error",
+                { status: upstreamRes.status, model: targetModel, hasLogId: Boolean(upstreamLogId), hasCfRay: Boolean(cfRay) },
                 `[opencode-free-bridge] Upstream server error (${upstreamRes.status}) on model ${targetModel}: ${rawMsg}` +
                   (upstreamLogId ? ` [x-opencode-log-id: ${upstreamLogId}]` : "") +
                   (cfRay ? ` [cf-ray: ${cfRay}]` : "") +
@@ -2945,7 +3008,10 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
               });
               const next = proxy.pick({ exclude: egressState.egressUrl });
               if (next.url && next.url !== egressState.egressUrl) {
-                console.warn(
+                logConsole(
+                  "warn",
+                  "gate_egress_failover",
+                  { status: gateStatus },
                   `[opencode-free-bridge] Gate refused egress ${
                     proxy.displayHost(egressState.egressUrl) || "direct"
                   } (${gateStatus}); moving to ${proxy.displayHost(next.url) || "direct"} for the retry`
@@ -2954,7 +3020,10 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
                 egressState.egressUrl = next.url;
               }
             }
-            console.warn(
+            logConsole(
+              "warn",
+              "gate_retry_started",
+              { status: gateStatus },
               `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}, ${verdict.reason || "unknown"}); refreshing identity and retrying once with full tool set`
             );
             ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(
@@ -2976,7 +3045,10 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
               signal: abortController.signal,
             }, egressUrl());
           } else {
-            console.warn(
+            logConsole(
+              "warn",
+              "gate_retry_skipped",
+              { status: gateStatus, cooldownSec: Math.round(GATE_RETRY_COOLDOWN_MS / 1000) },
               `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}); skipping retry because a full-shape retry already failed <${Math.round(GATE_RETRY_COOLDOWN_MS / 1000)}s ago on the current identity (IP cooldown active)`
             );
           }
@@ -3102,7 +3174,10 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
                     ? "the request carried every anchor the gate checks, so this is the egress: the per-IP free-tier allowance is spent or upstream refuses this network. The real CLI gets the same 403 from the same IP when it is"
                     : `this bridge produced a shape the gate refuses — missing ${missing.join(", ")}. That is a bridge bug, not an IP allowance: the same 403 is returned for both, which is why it is audited here`
                 : `no further identity change to apply; ${UPDATE_HINT}`;
-            console.warn(
+            logConsole(
+              "warn",
+              "gate_rejected",
+              { status: retryStatus, firstStatus: gateStatus, cooldownRetry: skipCooldownRetry, capacity, shapeOk },
               `[opencode-free-bridge] Upstream CLI gate rejected ${
                 skipCooldownRetry
                   ? "the request (no retry: cooldown active)"
@@ -3163,7 +3238,7 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
             res.write(payload);
           };
           const emitStreamError = (errMessage, errType) => {
-            console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${errMessage}`);
+            logConsole("warn", "stream_error", { type: errType }, `[opencode-free-bridge] Upstream failed inside the stream: ${errMessage}`);
             reader.cancel().catch(() => {});
             if (!sseHeadersSent) {
               sseHeadersSent = true;
@@ -3524,7 +3599,7 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
         await consumeSseLines(reader, decoder, handleNonStreamLine);
 
         if (streamError) {
-          console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${streamError}`);
+          logConsole("warn", "stream_error", {}, `[opencode-free-bridge] Upstream failed inside the stream: ${streamError}`);
           res.writeHead(502, { "Content-Type": "application/json" });
           return res.end(
             JSON.stringify({
@@ -3586,7 +3661,7 @@ function handleRequest(req: IncomingRequestLike, res: ServerResponseLike): void 
           }
           return res.end();
         }
-        console.error("[opencode-free-bridge] exception:", err);
+        logConsole("error", "request_exception", { error: err.message }, "[opencode-free-bridge] exception:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           return res.end(
@@ -3658,9 +3733,12 @@ const server = http.createServer(handleRequest);
 // would surface as MODULE_NOT_FOUND instead of the transport explanation.
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
-    console.log(`[opencode-free-bridge] v${VERSION} listening on http://${HOST}:${PORT}`);
+    logConsole("info", "bridge_listening", { version: VERSION, port: PORT, host: HOST }, `[opencode-free-bridge] v${VERSION} listening on http://${HOST}:${PORT}`);
     if (!ON_BUN) {
-      console.log(
+      logConsole(
+        "warn",
+        "node_offline_mode",
+        { runtime: "node" },
         "[opencode-free-bridge] WARNING: ALLOW_NODE=1 — running on Node. Real chat requests will " +
           "be refused by the free-tier gate with 403. This mode is for offline work against a " +
           "mocked upstream, not for live traffic."

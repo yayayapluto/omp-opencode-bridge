@@ -8,7 +8,7 @@
     {
       "name": "omp-opencode-bridge",
       "source": "./",
-      "version": "2.6.0",
+      "version": "2.7.0",
       "description": "Registers the opencode-free provider, starts a local Bun bridge, serves free OpenCode models, and manages the bridge from /opencode-free."
     }
   ]

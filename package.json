@@ -1,6 +1,6 @@
 {
   "name": "omp-opencode-bridge",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "description": "OpenCode free-tier models for OMP/pi: a local OpenAI-compatible bridge (no account required) plus the keyless provider plugin",
   "main": "server.ts",
   "bin": {

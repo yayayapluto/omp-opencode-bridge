@@ -34,6 +34,7 @@ test("installer fetches every file the runtime needs", () => {
   const src = fs.readFileSync(INSTALLER, "utf8");
   for (const f of [
     "server.ts",
+    "src/log.ts",
     "identity.ts",
     "token-budget.ts",
     "verify.ts",
@@ -369,6 +370,43 @@ test("a server.ts that requires a module the old updater never fetched still boo
   }
 });
 
+test("boot repair creates the nested src directory for src/log.ts", async () => {
+  const root = path.join(__dirname, "..");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ofb-repair-src-"));
+  const files = {
+    "src/log.ts": fs.readFileSync(path.join(root, "src", "log.ts"), "utf8"),
+    "proxy.ts": fs.readFileSync(path.join(root, "proxy.ts"), "utf8"),
+    "panel.ts": fs.readFileSync(path.join(root, "panel.ts"), "utf8"),
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const pathname = String(input).split("?")[0];
+    const rel = pathname.includes("/src/")
+      ? `src/${pathname.split("/").pop()}`
+      : pathname.split("/").pop();
+    const body = files[rel];
+    if (!body) return { ok: false, status: 404, text: async () => "" };
+    return { ok: true, status: 200, text: async () => body };
+  };
+  try {
+    // The fixture has no src/ directory, so a repair that cannot create one
+    // fails here instead of passing thanks to a pre-copied logger.
+    for (const f of fs.readdirSync(root)) {
+      if (!f.endsWith(".ts") || f === "proxy.ts" || f === "panel.ts") continue;
+      fs.copyFileSync(path.join(root, f), path.join(tmp, f));
+    }
+    fs.copyFileSync(path.join(root, "package.json"), path.join(tmp, "package.json"));
+    assert.equal(fs.existsSync(path.join(tmp, "src")), false);
+
+    const { __repairMissingModules } = require("../server");
+    await __repairMissingModules(tmp);
+    assert.equal(fs.readFileSync(path.join(tmp, "src", "log.ts"), "utf8"), files["src/log.ts"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("the updater stages every local module the incoming server.ts requires", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "server.ts"), "utf8");
   // The guard must read the *incoming* server.ts and fetch its imports, so an
@@ -377,6 +415,8 @@ test("the updater stages every local module the incoming server.ts requires", ()
   assert.match(src, /Staged newly required module/, "updater never logs a staged dependency");
   // And boot repairs a tree that is already missing modules.
   assert.match(src, /repairMissingModules\(\)/, "boot never repairs missing modules");
+  assert.match(src, /"src\/log\.ts"/, "updater does not ship src/log.ts");
+  assert.match(src, /mkdirSync\(path\.dirname\(tmpPath\), \{ recursive: true \}\)/, "updater cannot stage nested modules");
 });
 
 test("the panel API refuses cross-site and non-JSON writes", () => {
