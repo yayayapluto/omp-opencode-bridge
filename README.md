@@ -1,892 +1,442 @@
 # omp-opencode-bridge
 
-OpenAI/Anthropic-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier models, shipped with the keyless OMP/pi plugin. No account and no API key required.
+Keyless [OpenCode](https://opencode.ai) free-tier models for an OMP (`omp`) session. The package is two
+things in one: an OMP/pi plugin that registers an `opencode-free` provider, and a local Bun bridge on
+`http://127.0.0.1:20129/v1` that any OpenAI- or Anthropic-compatible client can call.
 
-It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible client (9Router, Cursor, Continue, LiteLLM, Open WebUI, or the OpenAI SDK) can call directly.
+No account, no API key (the key is literally `public`), no runtime dependencies — Node builtins only.
 
-## Origin
+## Table of Contents
 
-This repository packages the bridge from
-[azrinaldi/opencode-free-bridge](https://github.com/azrinaldi/opencode-free-bridge)
-(kept as the `upstream` remote) as a TypeScript runtime and an OMP/pi plugin.
-Upstream remains the source for the installer download path and the
-self-updater; this repository is what npm publishes and what
-`omp plugin install` fetches.
-
-
-## What's New in v2.0.0
-
-- **Bun TLS transport parity:** The official OpenCode CLI ships as a compiled Bun binary, and upstream's free-tier gate inspects the TLS `ClientHello` fingerprint (17 cipher suites and 12 TLS extensions in exact order). The bridge runs on Bun (`bun server.ts`), blocks accidental Node.js startups unless `ALLOW_NODE=1` is set for offline tests, and ships `transport-fingerprint.ts` to verify TLS parity against `transport-baseline.json`.
-- **Full source & catalog derivation:** All hardcoded model tables (`MODEL_MAP`) and model-name substring heuristics have been removed. Client version, commit SHA, session ID recipe (`ses_` + 12 hex + 14 base62), 7 gate headers, 13 tool plugins (parsed from upstream's Effect Schema AST in GitHub source, 12 active per model after `patch` vs `edit`/`write` swap), inference endpoints (`chatUrl` and `responsesUrl`), active free models, shorthand family aliases, and reasoning token limits are derived directly from OpenCode's update API, GitHub repository, and `models.opencode.ai/api.json`.
-- **On-disk catalog cache for instant cold starts:** Caches `models.opencode.ai/api.json` at `~/.opencode-free-bridge/cache/catalog.json` and loads it at startup (`OPENCODE_CACHE_DIR=off` disables disk caching). Shorthand aliases (`mimo`, `longcat`, `beam`), deprecated/paid model checks, and reasoning token budgets work on the very first request and when offline.
-- **Multi-layer reactive self-healing with IP-cooldown protection:** On `403 FreeTierError`, `426 UpgradeRequired`, or `404` on a migrated endpoint path, the bridge refreshes its recipe and catalog, evicts stale session IDs, mints a fresh session ID, escalates to the full tool profile, and retries once transparently. If a full-shape retry still returns `403 FreeTierError` (indicating a per-IP upstream cooldown rather than a stale request shape), subsequent requests within the 30s cooldown window (`GATE_RETRY_COOLDOWN_MS`, `GATE_REFRESH_COOLDOWN_MS`) skip redundant GitHub fetches and duplicate retries so the bridge never amplifies an IP penalty. **Exception:** the gateway's explicit IP-level abuse block (*"detected abusive traffic from this IP address"* / `Detect Abuse Traffic`) is terminal — the bridge answers it verbatim with `X-OpenCode-Gate: ip-abuse` and performs no refresh, session re-mint, or retry, because no client-side change can clear a flag keyed to the egress network.
-- **Gate anchors, so a shape bug can never masquerade as an IP block:** Upstream returns one `403 FreeTierError` — *"OpenCode's free tier can only be used from within OpenCode"* — for at least four unrelated causes: a refused egress IP, a request without a tool named `read`, a User-Agent that is not `opencode/<channel>/<semver>/<name>`, and a request without a session header. Measured by replaying byte-identical requests from a refused egress and a clean one, varying one field at a time: `read` + 11 fabricated tools → `200`, the real `read` renamed → `403`, a fabricated tool *named* `read` → `200`. The bridge therefore pins those anchors (`GATE_ANCHOR_TOOL_NAMES`, `GATE_ANCHOR_HEADER_NAMES`) independently of what the derived recipe and tool profile contain, audits the outgoing request when a `403` arrives, and reports `X-OpenCode-Gate: shape-rejected` plus the missing anchors instead of blaming the network. A second, unambiguous message (*"detected abusive traffic from this IP address"* or `Detect Abuse Traffic`) identifies a network-level block and is answered immediately as `ip-abuse`; only the ambiguous free-tier message goes through the shape audit at all. Upstream's `x-opencode-log-id` is recorded and exposed at `/health` (`identity.gate.lastRejection`) for correlation.
-- **Zero-dead-end universal installer:** `install.sh` finds or installs Bun (and `unzip` when missing on minimal Linux), stages and validates every file before touching a running bridge, retires legacy `opencode-bridge.service` units, rewrites `node` units to `bun`, configures `systemd` (Linux) or `launchd` (macOS), and verifies `/health` and the TLS fingerprint baseline before succeeding.
+- [Features](#features)
+- [Requirements](#requirements)
+- [Install](#install)
+  - [Step 1 — Install Bun (prerequisite)](#step-1--install-bun-prerequisite)
+  - [Step 2 — Install the plugin into OMP](#step-2--install-the-plugin-into-omp)
+  - [Step 3 — Verify it loaded](#step-3--verify-it-loaded)
+  - [Standalone bridge (no OMP)](#standalone-bridge-no-omp)
+  - [Service installer (Linux/macOS)](#service-installer-linuxmacos)
+  - [Docker](#docker)
+- [Usage](#usage)
+  - [Daily flow](#daily-flow)
+  - [Asking the model](#asking-the-model)
+  - [`/opencode-free`](#opencode-free)
+  - [Reading the health fields](#reading-the-health-fields)
+  - [Common prompts](#common-prompts)
+- [What it reads](#what-it-reads)
+- [Architecture](#architecture)
+- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+- [Security notes](#security-notes)
+- [License](#license)
 
 ## Features
 
-- **Self-healing client identity:** Derives the OpenCode CLI wire identity at the current release commit SHA and updates automatically when upstream tightens the gate.
-- **Live catalog discovery:** Reads `models.opencode.ai/api.json` (and `/v1/models`) to expose only active free-tier models (`cost.input === 0`, non-deprecated) and reject retired or paid model IDs locally with a clear error.
-- **Dual-protocol support:** Routes requests to `/inference/openai/v1/chat/completions` or `/inference/openai/v1/responses` based on catalog metadata and automatic protocol-mismatch detection.
-- **Reasoning-aware token budgeting:** Applies an additive token floor (`max(requested, 1024) + 4096`) for reasoning models (determined from catalog `reasoning: true` metadata) so short prompts do not return empty content with `finish_reason: "length"`.
-- **Reasoning stream normalization:** Emits thinking tokens under `reasoning_content` for both streaming SSE and non-streaming JSON responses, and forwards client tool calls with automatic name de-collision (`read` -> `read_client` upstream, restored to `read` on return).
-- **Zero dependencies:** Uses only built-in runtime modules (`http`, `crypto`, `fs`, `path`, `net`, `tls`). No `npm install` step.
-- **OMP / pi plugin:** Ships `src/index.ts`, declared under `pi.extensions`, so `omp plugin install omp-opencode-bridge` registers the local bridge as the keyless `opencode-free` provider and manages it with `/opencode-free`. No build step and still no dependencies beyond Node builtins.
-- **Container deployment:** Ships a `Dockerfile` and `docker-compose.yaml` (contributed in PR #1 by @rustam76, completed in v2.1.0). The image pins `oven/bun:1.4.3-slim` — the Bun version is pinned because the free-tier gate inspects the TLS `ClientHello` — runs as the non-root `bun` user, and publishes the port on loopback only.
+- **`opencode-free` provider** — `omp plugin install` registers every active free model, so a session
+  uses them with no key and no separate server setup. Models are re-read from the bridge's `/v1/models`.
+- **OpenAI-compatible bridge** — `POST /v1/chat/completions`, `GET /v1/models`, plus `/chat/completions`
+  and `/models` aliases, on `127.0.0.1:20129` by default.
+- **Anthropic Messages API** — `POST /v1/messages` (and `/messages`) with real SSE streaming, so Claude
+  Code and the Anthropic SDK can point at the same port. `POST /v1/messages/count_tokens` answers from a
+  4-chars-per-token estimate.
+- **Self-healing identity** — the CLI version, commit SHA, gate headers, session-ID recipe, tool profile
+  and inference endpoints are derived from OpenCode's update API, GitHub source tree and model catalog,
+  not hardcoded. A `403`/`426`/`404` triggers one refresh-and-retry.
+- **Live catalog with an on-disk cache** — free models (`cost.input === 0`, not deprecated) and their
+  reasoning/output limits come from `models.opencode.ai/api.json`, cached at
+  `~/.opencode-free-bridge/cache/catalog.json` for cold starts and offline use.
+- **Reasoning-aware token budget** — a reasoning model's `max_completion_tokens` gets an additive floor so
+  small probes do not return empty content with `finish_reason: "length"`; thinking tokens are emitted as
+  `reasoning_content` in both streaming and non-streaming responses.
+- **Tool-name compatibility** — a client tool whose name matches OpenCode's blocked pattern is sent as
+  `run_program` and restored to the client's name on the way back; colliding `read` tools are de-collided.
+- **Egress control** — a browser panel on `/` sets an HTTP proxy, an ordered pool of egress entries, or
+  routes through a relay, without restarting the bridge.
+- **Verification tooling** — `verify.ts` probes models with real prompts, `gate-drill.ts` corrupts the
+  identity on purpose and checks self-healing, `transport-fingerprint.ts` compares the runtime's TLS
+  ClientHello with the recorded OpenCode CLI baseline.
 
-## Requirements: Bun >= 1.0
+## Requirements
 
-Bun is required to talk to the live OpenCode gateway. Node.js 24+ (with its built-in TypeScript type stripping) can run the offline unit test suite, but upstream rejects Node.js requests with `403 FreeTierError` because Node's OpenSSL TLS `ClientHello` differs from the compiled OpenCode CLI (which is built on Bun/BoringSSL). The installer installs Bun for you when it is missing.
+- **Bun 1.0 or newer** to serve live traffic (`package.json` → `"engines": { "bun": ">=1.0.0" }`). The
+  free-tier gate inspects the TLS `ClientHello`, and only Bun reproduces the OpenCode CLI's transport.
+  Starting `server.ts` under Node exits with an explanation; `ALLOW_NODE=1` bypasses that guard for
+  offline tests only.
+- **Node 24.x** is supported only for the test suite (`npm run test:node`, type stripping).
+- **Linux (systemd) or macOS (launchd)** for the service installer. Windows is not supported by the
+  installer; the bridge itself runs under Bun anywhere.
+- **OMP (`omp` CLI) with extension support** for the plugin route. `@earendil-works/pi-coding-agent` is
+  an optional peer dependency, declared as a structural type in the extension, so it need not be installed.
+- **Docker + Compose** optionally, for the container route.
 
-Supported: Linux (systemd) and macOS (launchd). Windows is not supported; use WSL if you need it there.
+## Install
 
-Measured against a raw TCP listener and the live gateway from the same IP within one minute, using identical headers and payload:
-
-| Property | OpenCode CLI v2.0.32 | Bridge on Bun | Bridge on Node.js |
-|---|---|---|---|
-| TLS cipher suites offered | 17 | **17 (identical)** | 52 |
-| TLS extensions offered | 12 | **12 (identical order)** | 11 (different order) |
-| Default `Accept-Encoding` | `gzip, deflate, br, zstd` | **identical** | `gzip, deflate` |
-| Live gateway result | `200 OK` | **`200 OK` (6/6)** | `403 FreeTierError` (0/6) |
-
-Starting the server with `node server.ts` exits immediately with an explanation so a broken Node deployment cannot fail silently in the background:
+### Step 1 — Install Bun (prerequisite)
 
 ```bash
-bun server.ts                # required for live traffic
-node server.ts               # exits with code 1 and instructions
-ALLOW_NODE=1 node server.ts  # starts for offline tests and mocked upstreams only
+curl -fsSL https://bun.sh/install | bash
+bun --version
 ```
 
-You can verify that your local Bun binary matches the recorded OpenCode CLI TLS baseline at any time:
+### Step 2 — Install the plugin into OMP
+
+From npm (published, current `2.6.0`):
 
 ```bash
-bun transport-fingerprint.ts --check          # exits 0 if ciphers and extensions match
-bun transport-fingerprint.ts                  # prints current TLS ClientHello JSON
-bun transport-fingerprint.ts --write-baseline # updates transport-baseline.json
+omp plugin install omp-opencode-bridge
 ```
 
-## Install & Update
-
-### One-line installer (Linux & macOS)
+Or link a working tree — including uncommitted files:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main/install.sh | bash
+git clone https://github.com/yayayapluto/omp-opencode-bridge.git
+cd omp-opencode-bridge
+omp plugin install .
 ```
 
-What `install.sh` does:
-1. Finds `bun` across `PATH`, `$BUN_INSTALL/bin`, `~/.bun/bin`, `~/.local/bin`, `/usr/local/bin`, and `/opt/bun/bin`, or installs it via `https://bun.sh/install` (installing `unzip` first on minimal Linux images when needed).
-2. Downloads every file into a staging directory and validates it (in-process JS syntax compilation, JSON parsing, and `bash -n` for `tunnel-doctor.sh`) before touching anything that is already running.
-3. Checks port availability (`ss` or `lsof`), retires a pre-2.0 `opencode-bridge.service` that would hold port 20129, and stops its own running bridge when upgrading in place.
-4. Backs up the previous install under `~/.opencode-free-bridge/.backup-*`, then moves the staged files into place.
-5. Registers and starts the background service (`systemd` system or `--user` unit on Linux, `launchd` agent with `~/Library/Logs/opencode-free-bridge.log` on macOS).
-6. Waits up to 20 seconds for `/health`, runs the quick self-check, and checks the Bun TLS fingerprint against `transport-baseline.json`.
+Either way the extension is `src/index.ts` (declared under `"pi": { "extensions": ["./src/index.ts"] }`).
+On session start it reuses a bridge already listening on the port, otherwise spawns
+`bun server.ts` from the package root, detached, logging to `~/.opencode-free-bridge/omp-plugin.log`.
 
-If the bridge does not answer after 20 seconds, the installer exits with code `1` and prints the exact log inspection command. It only prints `Done.` when the bridge is answering.
+Plugin settings:
 
-Installer options:
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPENCODE_BRIDGE_PORT` | `20129` | Port the plugin probes and starts the bridge on |
+| `OPENCODE_BRIDGE_BUN` | `bun` | Bun binary used to spawn `server.ts` |
+| `OPENCODE_BRIDGE_STATE_DIR` | `~/.opencode-free-bridge` | State, log and model-cache directory |
+
+### Step 3 — Verify it loaded
 
 ```bash
-PORT=3000 BINDIR=/opt/opencode-free-bridge bash install.sh
-NO_SERVICE=1 bash install.sh   # install files only, skip systemd/launchd setup
+omp plugin list | grep opencode-free
+curl -s http://127.0.0.1:20129/health
 ```
 
-An occupied port aborts the install before anything is changed. To install alongside an existing service, choose a free port:
+`/health` must answer `"status":"ok"` with a `"runtime":"bun/..."`. Then run the self-check from the
+installed package (or the clone):
 
 ```bash
-PORT=20130 bash install.sh
+bun verify.ts --quick
 ```
 
-To update an existing installation, re-run the `curl ... | bash` command above. Running instances outside a git checkout also check for new releases in this repository every 6 hours (`AUTO_UPDATE=0` disables self-update).
+```text
+opencode-free-bridge — self check
+http://127.0.0.1:20129
 
-### Run from a git clone
+  OK  bridge v2.6.0, 11 free models discovered
+
+  egress: direct (this machine's IP)
+
+  Probing 3 of 11 models (quick — stops at the first success)...
+
+  OK   big-pickle                             2.1s  2 chars, 54 tokens
+
+Summary
+  1 usable, 0 blocked by upstream (0 gate-closed, 0 rate-limited), 0 broken
+
+  Bridge is working. Point any OpenAI-compatible client at http://127.0.0.1:20129/v1
+```
+
+Exit code `0` = a model answered, `2` = bridge healthy but the IP is refused upstream (cooldown or abuse
+block — the official CLI gets the same answer), `1` = real failure.
+
+### Standalone bridge (no OMP)
 
 ```bash
-git clone https://github.com/azrinaldi/opencode-free-bridge.git
-cd opencode-free-bridge
+npm install -g omp-opencode-bridge
+opencode-free-bridge
+```
+
+The `opencode-free-bridge` bin is `server.ts` with a Bun shebang. From a clone, equivalently:
+
+```bash
 bun server.ts
 ```
 
-`bash install.sh` inside the clone installs that working tree (including
-uncommitted or unpushed files) instead of downloading from GitHub. Force a
-download with `SOURCE=remote bash install.sh`.
+Options: `PORT` (default `20129`), `HOST` (default `127.0.0.1`).
 
-The server listens on `http://127.0.0.1:20129` by default.
-Open `http://127.0.0.1:20129/` for the panel: it shows the live egress state and sets
-an HTTP proxy for every outbound request. See [Egress proxy](#egress-proxy).
+### Service installer (Linux/macOS)
+
+```bash
+bash install.sh
+```
+
+Finds or installs Bun (and `unzip` on minimal Linux), stages and validates every file before touching a
+running bridge, backs up the previous install under `~/.opencode-free-bridge/.backup-*`, registers a
+systemd unit (Linux) or launchd agent (macOS), waits up to 20 s for `/health`, then runs the quick
+self-check and the TLS fingerprint check. It prints `Done.` only when the bridge answered.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `20129` | Listen port; an occupied port aborts before anything changes |
+| `HOST` | `127.0.0.1` | Bind address |
+| `BINDIR` | `~/.opencode-free-bridge` | Install directory |
+| `NO_SERVICE` | `0` | `1` installs files only, no systemd/launchd unit |
+| `SOURCE` | `auto` | `auto` installs the local tree when run from a clone, else downloads |
+| `REPO` | `azrinaldi/opencode-free-bridge` | Source repository for the remote path |
+
+Running instances outside a git checkout check this repository for updates every 6 hours
+(`AUTO_UPDATE=0` disables that).
 
 ### Docker
 
-The repository ships a `Dockerfile` and a `docker-compose.yaml` for container
-deployments (single host, no orchestrator needed):
-
 ```bash
-git clone https://github.com/azrinaldi/opencode-free-bridge.git
-cd opencode-free-bridge
 docker compose up -d
 ```
 
-The bridge is then reachable at `http://127.0.0.1:20129/v1` (API key `public`),
-exactly like a native install, and the model catalog cache survives restarts in
-the `bridge-cache` volume.
+The image pins `oven/bun:1.4.3-slim` (the TLS baseline is tied to that Bun build), runs as the non-root
+`bun` user, publishes `127.0.0.1:20129` on loopback only, and keeps the catalog cache and egress state in
+the `bridge-cache` / `bridge-state` volumes. Upgrade with `docker compose build --pull && docker compose up -d`.
 
-What the container setup does:
+## Usage
 
-- Runs on `oven/bun:1.4.3-slim` as the non-root `bun` user. The Bun version is
-  pinned because the free-tier gate inspects the TLS ClientHello: the image
-  must produce the same fingerprint as the OpenCode CLI, which
-  `transport-baseline.json` records.
-- Publishes the port on **loopback only**. The bridge has no authentication
-  (the API key is literally `public`), so publishing on `0.0.0.0` would expose
-  an open relay to the whole network. For remote access, put a reverse proxy
-  or an SSH tunnel in front of it.
-- Persists the on-disk catalog cache in the `bridge-cache` volume
-  (`OPENCODE_CACHE_DIR=/data/cache`), so a restart does not re-fetch the
-  upstream model catalog.
-- Persists the panel's egress-proxy setting in the `bridge-state` volume
-  (`OPENCODE_BRIDGE_STATE_DIR=/data/state`). Without it, the container
-  filesystem is thrown away on recreate and the proxy would silently revert.
-- Runs with `no-new-privileges` and all Linux capabilities dropped.
-
-The image is the unit of deployment, so `AUTO_UPDATE` defaults to `0` in the
-compose file: an in-place self-update is reverted by the next
-`docker compose build`. Upgrade with:
+### Daily flow
 
 ```bash
-docker compose build --pull && docker compose up -d
+# 1. bridge up (the OMP plugin does this on session start)
+bun server.ts
+
+# 2. see what the catalog currently offers
+curl -s http://127.0.0.1:20129/v1/models
+
+# 3. one request, OpenAI shape
+curl -s http://127.0.0.1:20129/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"Reply with the single word OK"}],"max_tokens":64}'
 ```
 
-Plain `docker run` works too — set `HOST=0.0.0.0` and publish the port
-yourself:
+```json
+{"id":"chatcmpl-…","object":"chat.completion","created":1795238343,"model":"big-pickle","choices":[{"index":0,"message":{"role":"assistant","content":"OK","reasoning_content":"…"},"finish_reason":"stop"}],"usage":{"prompt_tokens":797,"completion_tokens":31,"total_tokens":828}}
+```
+
+The Anthropic shape works on the same port:
 
 ```bash
-docker build -t opencode-free-bridge .
-docker run -d --name opencode-free-bridge \
-  -p 127.0.0.1:20129:20129 \
-  -e OPENCODE_CACHE_DIR=/data/cache \
-  -e OPENCODE_BRIDGE_STATE_DIR=/data/state \
-  -v opencode-free-bridge-cache:/data/cache \
-  -v opencode-free-bridge-state:/data/state \
-  opencode-free-bridge
+curl -s http://127.0.0.1:20129/v1/messages \
+  -H 'Content-Type: application/json' -H 'x-api-key: public' \
+  -d '{"model":"big-pickle","max_tokens":64,"messages":[{"role":"user","content":"Reply with OK"}]}'
 ```
 
-## OMP / pi plugin
-
-The same package is an OMP (`omp` CLI) / pi extension:
-installing it registers the bridge as the `opencode-free` provider, so an OMP
-session can use the free models with no API key and no separate server setup.
-The extension starts `bun server.ts` from the installed package on first use
-(reusing an already-running bridge) and stops nothing you started yourself.
-
-```bash
-omp plugin install omp-opencode-bridge     # from npm
-omp plugin install .                        # or link this working tree
-omp plugin list | grep opencode-free
+```json
+{"id":"msg_…","type":"message","role":"assistant","model":"big-pickle","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":794,"output_tokens":12}}
 ```
 
-Use a model:
-
-```bash
-omp --model opencode-free/mimo-v2.6-flash-free -p "hello"
-```
-
-Inside a session the `/opencode-free` command exposes the same surface:
-
-| Subcommand | Effect |
-|---|---|
-| `status` | bridge health, model count, runtime/version |
-| `models` | registered `opencode-free/<id>` list |
-| `refresh-models` | re-read `GET /v1/models` and re-register the provider |
-| `start` / `stop` / `restart` | control a bridge this plugin spawned |
-| `health` | raw `/health` JSON |
-| `logs` | tail `~/.opencode-free-bridge/omp-plugin.log` |
-
-Configuration: `OPENCODE_BRIDGE_PORT` (default `20129`),
-`OPENCODE_BRIDGE_BUN` (bun binary), `OPENCODE_BRIDGE_STATE_DIR` (state, log and
-model-cache directory). The extension entry point is `src/index.ts`, declared
-under `"pi": { "extensions": ["./src/index.ts"] }` — no build step, no
-dependencies beyond Node builtins.
-
-## Usage & Client Setup
+Any OpenAI-compatible client uses the same three settings:
 
 | Setting | Value |
 |---|---|
 | Base URL | `http://127.0.0.1:20129/v1` |
-| API Key | `public` (any non-empty string is accepted) |
-| Model ID | Any ID returned by `GET http://127.0.0.1:20129/v1/models` |
+| API key | `public` (any non-empty string) |
+| Model | any id from `GET /v1/models` |
 
-### 9Router
+Model IDs and family shorthands are derived from the upstream catalog, so they change with it — query
+`/v1/models` instead of hardcoding. Requests for retired or paid models are rejected locally with `404`:
 
-1. Add a custom OpenAI-compatible provider:
-   - **Base URL:** `http://127.0.0.1:20129/v1`
-   - **API Key:** `public`
-   - **Prefix:** `zen`
-   - **Model IDs:** leave empty and click **Import from /models endpoint**
-2. Models are imported as `zen/big-pickle`, `zen/mimo-v2.6-flash-free`, `zen/nemotron-3-ultra-free`, etc.
-3. Optional: if you run the bridge on multiple hosts (for example, a laptop and a VPS), register each host as a separate connection in 9Router so per-IP rate limits fail over automatically.
+```json
+{"error":{"message":"Model 'claude-sonnet-4-5' is not on the free tier, and this bridge has no account to run it with. Free models are listed at /v1/models.","type":"invalid_request_error","param":"model","code":"model_not_free"}}
+```
 
-**9Router's SSRF guard blocks `127.0.0.1` by default.** The guard exists so a
-request cannot reach an internal address, and the bridge's own base URL looks
-exactly like one. Two ways through, depending on how 9Router was started:
+### Asking the model
 
-| 9Router started… | What to do |
+```bash
+omp --model opencode-free/big-pickle -p "hello"
+omp --model opencode-free/mimo-v2.6-flash-free -p "summarize this diff"
+```
+
+Inside an interactive session, `/opencode-free models` lists what is registered.
+
+### `/opencode-free`
+
+| Subcommand | Effect |
 |---|---|
-| With `ALLOW_PRIVATE_NETWORKING=true` | Nothing. The guard short-circuits for the whole process, so loopback works as documented above. |
-| Without it | Add `ALLOW_PRIVATE_NETWORKING=true` to its service environment and restart. |
+| `status` | bridge online/offline, model count, runtime and version |
+| `models` | the registered `opencode-free/<id>` ids |
+| `refresh-models` | re-read `GET /v1/models` and re-register the provider |
+| `start` | reuse a healthy bridge or spawn one (20 s `/health` deadline) |
+| `stop` | stop only a bridge this plugin spawned |
+| `restart` | stop, respawn, re-register |
+| `health` | raw `/health` JSON |
+| `logs` | last 40 lines of `~/.opencode-free-bridge/omp-plugin.log` |
+| `help` | the list above |
 
-Symptom without it: the connection's test button fails and chat answers an
-error, both reporting `request to private/reserved IP blocked by SSRF
-protection`. The bridge itself is fine — `curl http://127.0.0.1:20129/health`
-still answers `ok` from that host, so those two symptoms together mean the
-guard, not the bridge.
-
-This only applies to 9Router running on the same machine. Every other client
-(LiteLLM, the OpenAI SDK, Cursor) talks to loopback directly and is unaffected.
-
-### LiteLLM, Open WebUI, Continue, Cursor
-
-Use the same three settings: Base URL `http://127.0.0.1:20129/v1`, API key `public`, and model IDs from `/v1/models`.
-
-```yaml
-# LiteLLM config.yaml example
-model_list:
-  - model_name: zen-mimo
-    litellm_params:
-      model: openai/mimo-v2.6-flash-free
-      api_base: http://127.0.0.1:20129/v1
-      api_key: public
-```
-
-### Anthropic Messages API
-
-The bridge also serves Anthropic's native `POST /v1/messages`, so Claude Code and
-the Anthropic SDK can point at it directly. Model ids are the same bare ids the
-OpenAI endpoint uses.
-
-| Setting | Value |
-|---|---|
-| Base URL | `http://127.0.0.1:20129` |
-| API key | `public` (sent as `x-api-key`, any non-empty string works) |
-| Path | `/v1/messages` |
-
-```bash
-curl -s http://127.0.0.1:20129/v1/messages \
-  -H 'Content-Type: application/json' \
-  -H 'x-api-key: public' \
-  -d '{"model":"big-pickle","max_tokens":1024,
-       "messages":[{"role":"user","content":"Reply with OK"}]}'
-```
-
-```python
-from anthropic import Anthropic
-
-client = Anthropic(base_url="http://127.0.0.1:20129", api_key="public")
-message = client.messages.create(
-    model="big-pickle",
-    max_tokens=1024,
-    messages=[{"role": "user", "content": "Reply with OK"}],
-)
-print(message.content[0].text)
-```
-
-Streaming is real, not replayed: `stream: true` relays each upstream delta as it
-arrives, including `input_json_delta` for tool calls. `POST
-/v1/messages/count_tokens` also answers — with a conservative 4-chars-per-token
-estimate, because this bridge has no Anthropic tokenizer and a made-up exact
-number would be worse than an honest approximation.
-
-Anthropic-only parameters with no OpenAI equivalent — `thinking`, `top_k`,
-`metadata`, `container` — are ignored, and the bridge logs one line naming them
-so a caller that expected a thinking budget can see why it got none.
-
-### Coding agents & CLI tools
-
-```bash
-export OPENAI_BASE_URL="http://127.0.0.1:20129/v1"
-export OPENAI_API_KEY="public"
-export MODEL="mimo-v2.6-flash-free"
-```
-
-### Python (OpenAI SDK)
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://127.0.0.1:20129/v1", api_key="public")
-
-response = client.chat.completions.create(
-    model="mimo-v2.6-flash-free",
-    messages=[{"role": "user", "content": "Write a Python palindrome checker."}],
-)
-print(response.choices[0].message.content)
-```
-
-### curl
-
-```bash
-curl -s http://127.0.0.1:20129/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"mimo-v2.6-flash-free","messages":[{"role":"user","content":"Reply with OK"}]}'
-```
-
-## Available Free Models
-
-The model list is derived dynamically from `models.opencode.ai/api.json` (`cost.input === 0` and `status !== "deprecated"`) and cached at `~/.opencode-free-bridge/cache/catalog.json`.
-
-Current active free-tier models in the upstream catalog:
-
-| Model ID | Family Shorthand | Reasoning | Max Output Tokens |
-|---|---|---|---|
-| `big-pickle` | `big-pickle` | Yes | 32,000 |
-| `beam-free` | `beam` | Yes | 131,072 |
-| `mimo-v2.6-flash-free` | `mimo` | Yes | 32,000 |
-| `nemotron-3-ultra-free` | `nemotron-free` | Yes | 128,000 |
-| `nemotron-3.5-lightning-free` | - | Yes | 262,144 |
-| `nemotron-3.5-super-vl-free` | - | Yes | 131,072 |
-| `longcat-2.5-preview-free` | `longcat` | Yes | 131,072 |
-| `deepseek-v4.1-flash-free` | `deepseek-flash` | Yes | 32,000 |
-| `glm-5.3-flash-free` | `glm-flash` | Yes | 32,000 |
-| `space-bunny-free` | - | Yes | 524,288 |
-
-Query the live list from your running bridge:
-
-```bash
-curl -s http://127.0.0.1:20129/v1/models
-```
-
-Requests for retired models (such as `cat-jam-free`, `muse-spark-1.3-contributor-free`, or `step-5-preview-free`) or paid models (such as `claude-sonnet-4-5` or `gpt-5.4`) are rejected locally with HTTP `404` and an explanation rather than being forwarded upstream to fail with `401 Missing API key`.
-
-## Reasoning Models & Token Budgets
-
-Reasoning models spend tokens on chain-of-thought before emitting visible text, and both share the same `max_completion_tokens` ceiling. When a client sends a small `max_tokens` (such as `50` or `100` for a health probe or title generator), a reasoning model can exhaust the entire budget while thinking and return an empty string with `finish_reason: "length"`.
-
-`token-budget.ts` checks the model's `reasoning` flag from the catalog (`identity.getModelFacts(modelId)`) and applies an additive floor:
-
-| Request Type | Effective `max_completion_tokens` Sent Upstream |
-|---|---|
-| Catalog `reasoning: true` model (or request with `reasoning_effort` set) | `min(max(requested, 1024) + 4096, modelMaxOutput)` |
-| Non-reasoning model | `min(max(requested, 512), modelMaxOutput)` |
-
-The client's requested value is never lowered (unless it exceeds the model's catalog `limit.output` or `131072`).
-
-## How Adaptive Identity & Self-Healing Work
-
-```
-Client ──▶ Bridge (:20129, Bun) ──▶ https://opencode.ai/inference/openai/v1/...
-                 │
-                 ├─ 1. Handshake: opencode.ai/update/api/latest/cli/npm
-                 │     -> resolves latest CLI version, minimum floor, and GitHub commit SHA
-                 ├─ 2. Source AST parser: raw.githubusercontent.com/anomalyco/opencode/<sha>/...
-                 │     -> extracts session ID recipe, UA template, 7 gate headers,
-                 │        13 tool plugins (Effect Schema AST), and model-conditional tool swaps
-                 ├─ 3. Provider catalog: models.opencode.ai/api.json (cached on disk)
-                 │     -> extracts inference endpoints, 10 free models, family aliases,
-                 │        deprecated/paid verdicts, and per-model reasoning/output limits
-                 └─ 4. On 403 / 426 / 404:
-                       -> refreshes recipe + catalog, evicts stale session ID, mints fresh
-                          ses_<12hex><14base62> ID, escalates to full tool profile, retries once
-                          (throttled for 30s if full-shape retry is still refused by per-IP gate)
-```
-
-### What is derived dynamically vs. fixed
-
-| Layer | Source | Fallback if unreachable |
-|---|---|---|
-| CLI version & minimum floor | `opencode.ai/update/api/latest/cli/npm` (fallback: GitHub `releases.atom`) | `DEFAULT_RECIPE.version` (`2.0.32`) |
-| Session ID charset, length, multiplier | `packages/schema/src/identifier.ts` | 62-char base62, length 26, mult `4096` |
-| Session ID prefix | `packages/schema/src/session-id.ts` | `ses_` |
-| User-Agent template | `packages/core/src/app.ts` | `opencode/${channel}/${version}/${cli}` |
-| Required & optional gate headers | `packages/core/src/session/model-request.ts` | 7 core OpenCode headers |
-| Tool plugin list & wire allowlist | GitHub tree listing of `packages/core/src/tool/plugin/*.ts` + `codemode/tool.ts` | 13 known plugins (`read`, `shell`, `edit`, etc.) |
-| Tool JSON schemas & descriptions | Effect Schema AST parser across plugin `.ts`, sibling `.txt`, and `@opencode/schema/*` | `DEFAULT_TOOLS` (`read`, `shell`) |
-| Model-conditional tool swaps (`edit`/`write` vs `patch`) | `packages/core/src/tool/plugin/patch.ts` | `gpt-*` condition rule |
-| Inference endpoints (`chatUrl`, `responsesUrl`) | `models.opencode.ai/api.json` (`opencode.api`, validated under `*.opencode.ai`) | `https://opencode.ai/inference/openai/v1/*` |
-| Free model list, paid/retired verdicts, family aliases, token limits | `models.opencode.ai/api.json` | `~/.opencode-free-bridge/cache/catalog.json` |
-
-### Inspecting live bridge state
+### Reading the health fields
 
 ```bash
 curl -s http://127.0.0.1:20129/health
 ```
 
-```json
-{
-  "status": "ok",
-  "provider": "opencode-free-bridge",
-  "version": "2.0.0",
-  "runtime": "bun/1.4.2",
-  "discoveredModels": 10,
-  "identity": {
-    "userAgent": "opencode/latest/2.0.32/cli",
-    "updateMode": "reactive",
-    "sourceTag": "d4a6223d017e17f1beaa91d3e6ecc6511c5132ad",
-    "versionFloor": null,
-    "lastCheckAgeMs": 1240,
-    "ttlMs": 900000,
-    "lastError": null,
-    "release": {
-      "version": "2.0.32",
-      "sha": "d4a6223d017e17f1beaa91d3e6ecc6511c5132ad",
-      "minimum": false,
-      "active": true,
-      "channel": "latest",
-      "source": "update-api",
-      "resolvedAt": 1760740000000,
-      "stale": false
-    },
-    "available": null,
-    "headers": [
-      "x-opencode-session-id",
-      "x-session-affinity",
-      "X-Session-Id",
-      "User-Agent",
-      "x-opencode-project",
-      "x-opencode-session",
-      "x-opencode-client"
-    ],
-    "unsentHeaders": [],
-    "endpoints": {
-      "chatUrl": "https://opencode.ai/inference/openai/v1/chat/completions",
-      "responsesUrl": "https://opencode.ai/inference/openai/v1/responses",
-      "modelsUrl": "https://opencode.ai/inference/v1/models",
-      "catalogBase": "https://opencode.ai/inference/openai/v1"
-    },
-    "toolNames": [
-      "read", "shell", "edit", "write", "glob", "grep", "patch",
-      "question", "skill", "subagent", "webfetch", "websearch", "execute"
-    ],
-    "tools": {
-      "source": "source",
-      "version": "2.0.32",
-      "toolNames": [
-        "execute", "edit", "glob", "grep", "patch", "question",
-        "read", "shell", "skill", "subagent", "webfetch", "websearch", "write"
-      ]
-    }
-  }
-}
-```
+| Field | Meaning |
+|---|---|
+| `status` | `ok` when the server is answering |
+| `version` / `runtime` | bridge version and `bun/<version>` or `node/<version>` |
+| `discoveredModels` | free models the current catalog produced |
+| `egress.mode` | what carries requests: `pool`, `proxy`, `relay`, or `direct` |
+| `egress.proxy` | credential-free description: `mode`, `proxy` (`host:port`), `source`, `locked`, `configPath` |
+| `egress.proxy.pool` | pool `size`/`enabled`/`ready`/`cooling`, `strategy`, cooldown bounds, per-entry state |
+| `egress.usage` | per-egress request counts and token totals for the current day |
+| `identity.userAgent` | the derived `opencode/<channel>/<version>/<cli>` |
+| `identity.sourceTag` | the GitHub commit SHA the recipe came from |
+| `identity.headers` / `unsentHeaders` | gate headers sent, and any expected but unsent |
+| `identity.endpoints` | resolved `chatUrl`, `responsesUrl`, `modelsUrl`, `catalogBase` |
+| `identity.toolNames` | tools the derived profile allows on the wire |
 
-## Testing, Verification & Gate Drills
+### Common prompts
 
-```bash
-bun test                        # 165 offline unit, contract, and regression tests
-bun run verify                  # live check: probes every discovered free model
-bun run verify:quick            # live check: stops at the first model that answers
-bun run drill                   # runs live + offline self-healing gate drills
-bun run fingerprint:check       # checks Bun TLS ClientHello against transport-baseline.json
-```
+| You want | Prompt |
+|---|---|
+| Confirm the bridge end to end | `bun verify.ts --quick` (or `npm run verify:quick`) |
+| Confirm TLS parity | `bun transport-fingerprint.ts --check` |
+| Prove self-healing works | `bun gate-drill.ts` (offline drills at minimum) |
+| Check which IP upstream sees | open `http://127.0.0.1:20129/`, **Uji koneksi** |
+| Diagnose a `403` | `/opencode-free health`, then read `identity.gate` |
+| List models a client can use | `curl -s http://127.0.0.1:20129/v1/models` |
 
-`verify.ts` exits `0` when a model answers, `2` when the bridge is healthy and its TLS fingerprint matches the baseline but upstream refuses this IP (free-tier allowance or an explicit abuse block), and `1` for a real failure (bridge unreachable, running on Node.js, or TLS fingerprint drift). The `2` case is what a throttled or flagged network looks like: the official OpenCode CLI gets the same `403 FreeTierError` from the same IP at the same moment, so it is not a reason to reinstall or edit headers. The bridge labels the refusal (`X-OpenCode-Gate: ip-throttled | ip-abuse | shape-rejected`), so `verify.ts` no longer depends on upstream keeping identical wording.
+## What it reads
 
-`gate-drill.ts` deliberately corrupts the bridge's state and verifies that a single client request triggers self-healing and still returns `HTTP 200`:
+Environment (read in `server.ts`, `identity.ts`, `proxy.ts`, `token-budget.ts`, `src/index.ts`):
 
-| Drill | Mode | What it corrupts / stages | What it verifies |
-|---|---|---|---|
-| `version-floor` | Live | User-Agent version below floor | `426 UpgradeRequired` -> floor learned -> identity refreshed -> retry succeeds |
-| `empty-tools` | Live | Empty tool profile | Falls back to shipped tool definitions instead of sending `tools: []` |
-| `session-shape` | Live | Unrecognized session ID prefix | `403 FreeTierError` -> recipe refreshed -> old ID evicted -> fresh `ses_...` ID minted |
-| `legacy-shape` | Live | Pre-v1.5 request shape | Control check against live upstream |
-| `routing` | Offline | `chatUrl` repointed after boot | Endpoints are resolved per request from recipe/catalog, not frozen at boot |
-| `allowlist` | Offline | Upstream renames a tool (`shell` -> `run`) | Extracted tool name reaches the wire in `full` scope and retired name is dropped |
-| `retry-endpoint` | Offline | `403` gate rejection + catalog URL change | The self-heal retry uses the newly refreshed endpoint URL |
-| `endpoint-move` | Offline | `404` on retired endpoint path | Re-reads catalog on `404` and retries at the new path transparently |
-| `gate-heal` | Offline | Stale prefix + minimal tool scope | Full heal order: `403` -> refresh -> re-mint session ID -> escalate to full tools -> `200` |
-| `full-corrupt` | Offline | Version `0.9.9`, prefix `old_`, length `20`, hex charset, default tools | One client request heals all corrupted layers simultaneously from source and returns `200` |
-
-Before running the 4 live drills, `gate-drill.ts` sends a single CLI-shaped control probe. If the current IP is temporarily throttled by upstream (`403 FreeTierError` on the control probe), the 4 live drills report `SKIP` so they do not extend the IP cooldown, while the 6 offline drills still execute and determine the exit code.
-
-## Configuration
-
-| Environment Variable | Default | Description |
+| Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `20129` | HTTP listen port |
-| `HOST` | `127.0.0.1` | Bind address (keep on `127.0.0.1` or behind a firewall; the server has no auth) |
-| `CORS_ORIGIN` | `""` (localhost only) | Allowed CORS origin(s), comma-separated or `*` |
-| `UPSTREAM_TIMEOUT_MS` | `120000` | Upstream fetch timeout in milliseconds |
-| `MAX_BODY_BYTES` | `10485760` | Maximum request body size in bytes (10 MiB) |
-| `IDENTITY_TTL_MS` | `900000` | Identity freshness TTL in milliseconds (15 minutes) |
-| `UPDATE_MODE` | `reactive` | `reactive` adopts new CLI releases only on `403`/`426` or `minimum: true`; `always` adopts every release on TTL expiry |
-| `GATE_RETRY_COOLDOWN_MS` | `30000` | Cooldown window (ms) after a failed full-shape `403` retry during which duplicate retries are suppressed until identity changes |
-| `GATE_REFRESH_COOLDOWN_MS` | `30000` | Cooldown window (ms) between forced GitHub/catalog refreshes during a `403` burst |
-| `DNS_RESULT_ORDER` | `ipv4first` | DNS resolution order passed to `dns.setDefaultResultOrder` (`ipv4first`, `ipv6first`, `verbatim`). Read by both `server.ts` and `egress-proxy.ts`: the gateway refuses IPv6 egress, so a pool member on a dual-stack host must not dial upstream over AAAA |
-| `TOOL_PROFILE_SCOPE` | `core` | `core` sends the minimal gate anchor (`read`, `shell`) on first attempt and escalates to `full` (all model-applicable tools) on retry; `full` sends the full tool profile on every request |
-| `OPENCODE_CHANNEL` | `latest` | OpenCode release channel (`latest`, `beta`, `dev`) |
-| `OPENCODE_MAJOR` | _(unset)_ | Pin a major version line (for example `2`) |
-| `OPENCODE_USER_AGENT` | _(derived)_ | Override `User-Agent` and disable dynamic identity derivation |
-| `OPENCODE_CATALOG_URL` | `https://models.opencode.ai/api.json` | Provider catalog URL |
-| `OPENCODE_CACHE_DIR` | `~/.opencode-free-bridge/cache` | Directory for the on-disk `catalog.json` cache (`off` disables disk caching) |
-| `OPENCODE_CHAT_URL` | _(derived)_ | Override the upstream Chat Completions endpoint URL |
-| `OPENCODE_RESPONSES_URL` | _(derived)_ | Override the upstream Responses API endpoint URL |
-| `UPSTREAM_RELAY_URL` | _(unset)_ | Route inference through an egress relay (`x-relay-target` / `x-relay-path` contract); empty = direct. See [Optional egress relay](#optional-egress-relay) |
-| `UPSTREAM_PROXY_URL` | _(unset)_ | Operator-level default for the egress proxy (`http://[user:pass@]host:port`). When set it wins over the panel and locks runtime edits. See [Egress proxy](#egress-proxy) |
-| `PANEL_ALLOWED_HOSTS` | _(unset)_ | Extra `Host` names the panel and `/api/proxy` accept (comma-separated), for a reverse proxy in front of the bridge. Loopback names and the configured `HOST` are always accepted |
-| `AUTO_UPDATE` | `1` | Poll GitHub for bridge updates every 6 hours (automatically skipped inside a `.git` checkout; set `0` to disable) |
-| `ALLOW_NODE` | _(unset)_ | Set `ALLOW_NODE=1` to bypass the startup Bun check for offline tests |
+| `HOST` | `127.0.0.1` | Bind address |
+| `CORS_ORIGIN` | `""` (loopback only) | Allowed origins, comma-separated or `*` |
+| `UPSTREAM_TIMEOUT_MS` | `120000` | Upstream fetch timeout |
+| `MAX_BODY_BYTES` | `10485760` | Request body cap (10 MiB) |
+| `IDENTITY_TTL_MS` | `900000` | Identity freshness TTL |
+| `UPDATE_MODE` | `reactive` | `reactive` adopts releases on `403`/`426` or `minimum: true`; `always` on TTL |
+| `GATE_RETRY_COOLDOWN_MS` | `30000` | Suppress duplicate `403` retries for this window |
+| `GATE_REFRESH_COOLDOWN_MS` | `30000` | Minimum gap between forced refreshes during a `403` burst |
+| `DNS_RESULT_ORDER` | `ipv4first` | `dns.setDefaultResultOrder` value; the gateway refuses IPv6 egress |
+| `TOOL_PROFILE_SCOPE` | `core` | `core` sends the minimal gate anchors first, `full` sends the whole profile |
+| `OPENCODE_CHANNEL` | `latest` | Release channel: `latest`, `beta`, `dev` |
+| `OPENCODE_MAJOR` | unset | Pin a major version line |
+| `OPENCODE_USER_AGENT` | derived | Override the UA and disable derivation |
+| `OPENCODE_CATALOG_URL` | `https://models.opencode.ai/api.json` | Catalog source |
+| `OPENCODE_CACHE_DIR` | `~/.opencode-free-bridge/cache` | On-disk catalog cache (`off` disables) |
+| `OPENCODE_CHAT_URL` / `OPENCODE_RESPONSES_URL` | derived | Override inference endpoints |
+| `UPSTREAM_RELAY_URL` | unset | Send inference through a relay (`x-relay-target` / `x-relay-path`) |
+| `UPSTREAM_PROXY_URL` | unset | Operator-level egress proxy; locks panel edits |
+| `UPSTREAM_PROXY_POOL` | unset | Pool entries, comma/newline separated, `label=url` optional |
+| `UPSTREAM_PROXY_STRATEGY` | `round-robin` | `round-robin`, `failover`, `random` |
+| `PANEL_ALLOWED_HOSTS` | unset | Extra `Host` names accepted by the panel and `/api/proxy` |
+| `AUTO_UPDATE` | `1` | Check for bridge updates every 6 h (skipped in a `.git` checkout) |
+| `ALLOW_NODE` | unset | `1` bypasses the Bun runtime guard (offline tests only) |
 
-### Optional egress relay
+State and caches under `~/.opencode-free-bridge` (or `OPENCODE_BRIDGE_STATE_DIR`):
 
-Set `UPSTREAM_RELAY_URL` to a relay that speaks the same contract as 9Router's
-Cloudflare/Vercel/Deno/Netlify relays. The bridge POSTs to the relay with
-`x-relay-target: <origin>` and `x-relay-path: <path>`, and the relay replays the
-request at that origin; upstream therefore sees the relay's egress IP.
+| Path | Written by | Contents |
+|---|---|---|
+| `cache/catalog.json` | `identity.ts` | Upstream model catalog for cold starts |
+| `proxy.json` | `proxy.ts` / panel | Egress proxy, pool and strategy (mode `0600`) |
+| `pool-health.json` | `proxy.ts` | Per-egress cooldowns, keyed by hashed egress identity |
+| `omp-plugin.json` | `src/index.ts` | Port and pid of the bridge the plugin spawned |
+| `omp-models.json` | `src/index.ts` | Last discovered model list, used before the bridge starts |
+| `omp-plugin.log` | spawned bridge | Bridge stdout/stderr when started by the plugin |
 
-```bash
-UPSTREAM_RELAY_URL="https://relay.example.workers.dev" bun server.ts
+Ports: `20129` (bridge + panel). `egress-proxy.ts` listens on `PORT` (default `8888`) when run as a pool
+member. `/healthz` on that proxy is unauthenticated and reports only connection count and uptime.
+
+Side effects: writes only the files above; outbound HTTPS to the OpenCode update API, GitHub raw/tree
+endpoints, `models.opencode.ai` and the inference endpoints; with `AUTO_UPDATE=1`, downloads and
+hot-swaps updated bridge files (syntax-checked first) inside the install directory.
+
+## Architecture
+
+```text
+omp-opencode-bridge/
+├── server.ts                  # HTTP server: routing, panel, gate retries, protocol lanes
+├── identity.ts                # derives CLI identity, headers, session IDs, tool profile, catalog
+├── token-budget.ts            # reasoning-aware max_completion_tokens floor
+├── anthropic.ts               # Anthropic Messages API <-> OpenAI translation
+├── proxy.ts                   # egress proxy, pool, health persistence, usage counters
+├── egress-proxy.ts            # dependency-free CONNECT/absolute-URI proxy for pool members
+├── panel.ts                   # HTML/JSON for the browser panel
+├── transport-fingerprint.ts   # TLS ClientHello dump/compare against transport-baseline.json
+├── verify.ts                  # real-prompt self check, exit 0/1/2
+├── gate-drill.ts              # live + offline self-healing drills
+├── tunnel-doctor.sh           # diagnose/reap stale ssh -R forwarders
+├── install.sh                 # Bun discovery, staged install, systemd/launchd unit
+├── src/index.ts               # OMP/pi extension: provider registration + /opencode-free
+├── test/                      # bun test suites (server, identity, proxy, retry, drills, …)
+├── Dockerfile, docker-compose.yaml
+└── package.json
 ```
 
-The relay covers inference requests and their retries; model discovery and
-identity synchronization stay direct. `/health` reports `egress.mode` (`direct`
-or `relay`) and the relay's origin, without credentials or query strings. Use a
-trusted HTTPS relay: it receives the request headers (including
-`Authorization: Bearer public`) and the full prompt. Changing the variable
-requires a restart.
-
-### Egress proxy
-
-Open `http://127.0.0.1:20129/` and enter an HTTP proxy. Every outbound request
-the bridge makes then tunnels through it (`CONNECT`), so upstream sees the
-proxy's IP rather than this machine's. That covers inference, model discovery,
-identity sync, and the self-updater.
-
-- **Protocol:** `http://` and `https://` only. Bun's fetch accepts those and
-  tunnels TLS itself, so `transport-baseline.json` still matches. SOCKS5 is
-  refused by Bun (`UnsupportedProxyProtocol`) and rejected in the panel with
-  that reason.
-- **Credentials:** `http://user:pass@host:port`, percent-encoded if they contain
-  `@`, `:`, or `/`. They are stored in `~/.opencode-free-bridge/proxy.tson`
-  (mode `0600`) and never returned by the panel, `/api/proxy`, or `/health`;
-  those show `host:port` only.
-- **Test before trusting it:** *Uji koneksi* fetches the models endpoint through
-  the candidate proxy and reports the exit IP from `cdn-cgi/trace`. A 403 there
-  means the proxy reaches upstream but its egress is refused.
-- **No restart:** the setting is read on every request. *Matikan proxy* returns
-  to direct egress.
-- **Operator override:** `UPSTREAM_PROXY_URL` beats the panel and locks runtime
-  edits to it.
-- **Only from this machine:** the panel and `/api/proxy` accept `Host` names of
-  loopback (or the configured bind address) plus anything in
-  `PANEL_ALLOWED_HOSTS`, reject cross-site requests, and require
-  `Content-Type: application/json` for writes. That blocks a random website from
-  re-pointing your egress and blocks DNS rebinding. Put a reverse proxy in front
-  and add its name to `PANEL_ALLOWED_HOSTS` if you reach the panel that way.
-- **Container:** the compose file mounts the `bridge-state` volume at
-  `/data/state` (`OPENCODE_BRIDGE_STATE_DIR`) so the setting survives a
-  recreate. Plain `docker run` needs that env var and volume too.
-
-### Egress pool
-
-The free-tier allowance is per egress IP, not per account. Running one bridge
-per host multiplies processes, service units and tunnels without giving anything
-a pool does not: the pool rotates the egress while one process keeps the
-identity, the catalog and the session cache in one place.
-
-A pool is a list of egress entries. Each keeps its own health, so an entry that
-upstream throttles is skipped until its cooldown ends instead of being retried
-by every request.
-
-```bash
-# in the panel under "Pool egress", one entry per line
-med1=http://pool:token@127.0.0.1:20251
-med2=http://pool:token@127.0.0.1:20252
+```text
+OMP session ──▶ src/index.ts ──spawns──▶ server.ts (:20129)
+                                            │
+client ──POST /v1/chat/completions──▶ bridge ──▶ opencode.ai/inference/openai/v1/…
+   or  ──POST /v1/messages──────▶ anthropic.ts ──┘        ▲
+                                                          │
+identity.ts: update API → GitHub source (recipe, tools) ──┤
+               models.opencode.ai/api.json (catalog) ──────┤
+on 403/426/404: refresh → evict stale session ▸ mint new ▸ escalate tools ▸ retry once
 ```
 
-```bash
-# operator override: comma- or newline-separated, label=url optional
-UPSTREAM_PROXY_POOL="med1=http://a:1,med2=http://b:2" \
-UPSTREAM_PROXY_STRATEGY=failover \
-  bun server.ts
-```
+The bridge holds no model code: every model id, limit and endpoint is resolved per request from the
+catalog/recipe, which is why a retired upstream model turns into a local `404` and an endpoint move
+heals on the first retry.
 
-- **Entry shape:** a URL string, `{id,label,url,enabled,weight}`, or
-  `{direct: true}` for this machine's own address. `direct` is a first-class
-  entry, so the hosting IP can take part in the rotation instead of being the
-  fallback used only when every proxy is down.
-- **Strategies:** `round-robin` (default; even spread across healthy entries),
-  `failover` (sticky on the first healthy entry, which keeps upstream prompt
-  caching on one IP), `random` (weighted).
-- **Cooldown:** a refusal on a pooled egress is recorded against *that* entry.
-  The backoff doubles per consecutive failure from `cooldownMs` (default 120 s)
-  up to `maxCooldownMs` (default 30 min); a success resets it. A `429` earns four
-  times the base window because it is an unambiguous allowance answer.
-- **Always sends:** when every entry is cooling, the one that recovers first is
-  used anyway. Refusing would turn a throttled pool into a dead bridge, and
-  upstream answers a throttled IP with a normal refusal the caller already
-  handles.
-- **Failover on a gate rejection:** the bridge drops the entry that was refused
-  and retries through a different one, in the same request. An unreachable proxy
-  is also failed over, since nothing reached upstream.
-- **One egress per request:** the protocol-lane, endpoint-migration, 5xx and
-  gate retries all reuse the entry the request started on, because upstream ties
-  a retry to the address that saw the first attempt. Only the two cases above
-  move it.
-- **`/health`** reports `egress.mode: "pool"` and `egress.proxy.pool` with each
-  entry's host, state, remaining cooldown and failure count. Credentials are
-  never included.
-
-#### Health across restarts
-
-Cooldowns are written to `<state dir>/pool-health.json` (mode `0600`), so a
-service restart or a host suspend/resume does not forget which IPs are spent and
-re-burn all of them.
-
-- A refusal is written immediately; a success is coalesced over one second,
-  because a success arrives with every request and a rewrite per request would
-  turn a memory update into disk churn.
-- The file is written by rename, so a crash mid-write keeps the previous copy
-  instead of leaving a truncated one that would cost every cooldown.
-- Records are keyed by a truncated SHA-256 of the egress identity, not by URL,
-  so the file is not a second copy of the proxy credentials. A `label` field
-  carries `host:port` (or `direct`), which `/health` already exposes.
-- Saving the pool in the panel keeps existing cooldowns; only an entry that
-  leaves the pool loses its record.
-- A corrupt or missing health file costs the cooldowns and nothing else: the
-  bridge starts, reports the pool from `proxy.tson`, and treats every entry as
-  ready.
-
-#### Turning a host into a pool member
-
-`egress-proxy.ts` is a dependency-free HTTP proxy for exactly this: it answers
-`CONNECT` and absolute-URI HTTP, and forwards bytes without inspecting them.
-Its TLS is tunneled end to end, so it never sees plaintext.
+## Development
 
 ```bash
-# on the node
-PORT=8888 EGRESS_PROXY_TOKEN=secret bun egress-proxy.ts
-
-# from the bridge host: put it on a loopback port, so the proxy itself is never
-# exposed and the tunnel carries the authentication
-ssh -L 127.0.0.1:20251:127.0.0.1:8888 node
+bun test                          # unit, contract and regression suites
+npm run drill                     # live + offline self-healing gate drills
+npm run verify                    # probe every discovered free model
+npm run verify:quick              # stop at the first model that answers
+npm run fingerprint:check         # TLS ClientHello vs transport-baseline.json
+npm run test:node                 # Node 24 compatibility pass (type stripping)
 ```
 
-`/healthz` is unauthenticated on purpose: it reports a connection count and an
-uptime, nothing about the target or the token, so a monitor does not need the
-credential to ask whether the proxy is up.
+`gate-drill.ts` accepts drill names as arguments; the offline drills (`routing`, `allowlist`,
+`retry-endpoint`, `endpoint-move`, `gate-heal`, `full-corrupt`) never touch the network, which is why CI
+runs `bun gate-drill.ts`. The four live drills are skipped (not failed) when a CLI-shaped control probe is
+refused, so a throttled IP does not turn CI red.
 
-`/health` reports `egress.mode` (`pool`, `proxy`, `relay`, or `direct`) plus
-`egress.proxy` with the same credential-free description.
-
-The proxy applies *in addition to* the relay: with both configured, the request
-is still sent to `UPSTREAM_RELAY_URL`, and that connection is dialled through
-the proxy.
+CI (`.github/workflows/ci.yml`) runs `bun test test/*.test.js`, `bun gate-drill.ts` and
+`bun transport-fingerprint.ts --check` on Bun, plus a Node 24 compatibility job.
 
 ## Troubleshooting
 
-### `403` with "detected abusive traffic" / `Detect Abuse Traffic` (IP-level block)
+| Symptom | Cause | Fix |
+|---|---|---|
+| `server.ts` exits printing "requires Bun" | Started with Node; the gate refuses Node's TLS `ClientHello` | Run `bun server.ts`; install Bun from `bun.sh` |
+| `403 FreeTierError` right after a retry | IP-level free-tier cooldown, not a shape bug | Wait out the window (`GATE_RETRY_COOLDOWN_MS`), or change egress (tunnel, proxy, another host) |
+| `403` mentioning "abusive traffic" / `Detect Abuse Traffic` | Gateway flagged the egress IP; reported as `identity.gate.status: "ip-blocked"` | Not fixable locally — change egress or contact upstream with `x-opencode-log-id` |
+| `426 UpgradeRequired` | Derived version below the floor | Self-heals on retry; if it persists check `identity.available` |
+| `429 FreeUsageLimitError` | Allowance spent, `tools: []`, or a system prompt without the `<env>` block | Use `TOOL_PROFILE_SCOPE=full`; the bridge appends the `<env>` anchor itself in 2.6.0 |
+| `429 RateLimitError` / `BUSY` | Per-model or per-IP throttling upstream | Try another id from `/v1/models` |
+| `404` "is not on the free tier" / "has been retired upstream" | Model is paid or deprecated in the catalog | Pick a current id from `/v1/models` |
+| `verify.ts` exits `2` | Bridge healthy, TLS fine, upstream refuses this IP | Same answer as the official CLI from this IP; change egress or wait |
+| `verify.ts` exits `1` | Bridge unreachable, running on Node, or TLS drift | `curl /health`, check `bun transport-fingerprint.ts --check` |
+| `omp` starts but `opencode-free` has no models | Bridge never came up; only the cached list was registered | `/opencode-free start`, then `/opencode-free logs` |
+| `opencode-free-bridge did not answer /health … within 20000ms` | Spawned Bun failed (missing binary, port busy, bad cwd) | Set `OPENCODE_BRIDGE_BUN` to an absolute bun path; read `~/.opencode-free-bridge/omp-plugin.log` |
+| Panel refuses a proxy URL with `UnsupportedProxyProtocol` | SOCKS5 is not accepted by Bun's fetch | Use `http://` or `https://` (`http://user:pass@host:port`) |
+| Panel answers `403`, `Host` rejected | Request came from a non-loopback name or a rebinding attempt | Add the proxy's name to `PANEL_ALLOWED_HOSTS` |
+| `remote port forwarding failed for listen port 20136` | Stale `ssh -R` listener on the receiving host | `./tunnel-doctor.sh --reap`, and shorten `ClientAliveInterval` on the receiver |
+| `bun: command not found` in a fresh SSH session | `~/.bun/bin` is only on an interactive shell's PATH | `export PATH="$HOME/.bun/bin:$PATH"` or use the absolute path |
 
-This is not the shape gate and not a stale bridge. The gateway has flagged the
-network's egress IP for abusive traffic; the message says it is unrelated to the
-account. The bridge treats it as terminal: it does **not** refresh the identity,
-re-mint the session id, or retry, and returns the refusal verbatim with
-`X-OpenCode-Gate: ip-abuse`. `/health` reports `identity.gate.status:
-"ip-blocked"` and `identity.gate.lastRejection.kind: "ip-abuse"`.
+## Security notes
 
-The official OpenCode CLI gets the same answer from the same network. Only
-upstream can clear the flag (`help@anoma.ly`, with the time it started and the
-`x-opencode-log-id` from the response). Until then, change egress (route through
-another host or SSH tunnel), subscribe to OpenCode Go, or wait. Reinstalling the
-bridge or editing headers will not help.
+- **No authentication.** The API key is the literal string `public`; anyone who can reach the port can
+  spend the free-tier allowance. Keep `HOST=127.0.0.1` (the default) or put a real gateway in front.
+- **Loopback-only panel.** `/`, `/api/proxy` and `/api/proxy/test` accept loopback names (or the bind
+  address) plus `PANEL_ALLOWED_HOSTS`; writes require `Content-Type: application/json` and cross-site
+  requests are refused, so a random page cannot re-point your egress.
+- **Credentials stay local.** Proxy credentials are stored in `proxy.json` with mode `0600` and never
+  appear in `/health`, the panel, or API responses — only `host:port` is reported. `pool-health.json` keys
+  records by a truncated hash, not by URL.
+- **The relay sees plaintext.** `UPSTREAM_RELAY_URL` is trusted with request headers (including the
+  authorization value) and the full prompt. Prefer a relay you operate.
+- **The self-updater writes code.** With `AUTO_UPDATE=1` it downloads from this repository and swaps files
+  in the install directory after syntax-checking them; set `AUTO_UPDATE=0` in containers or where the
+  install directory must stay immutable.
+- **Third-party prompts.** `identity.ts` reproduces OpenCode's tool descriptions and schema fields; see
+  [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
 
-### `403 FreeTierError` persists even after retry
+## License
 
-When the bridge receives `403 FreeTierError`, it refreshes its recipe from OpenCode's update API and GitHub source tree, re-mints the session ID, escalates to the full tool profile, and retries once. If the message names an explicit IP-level abuse block (`abusive traffic` / `Detect Abuse Traffic`), this path is skipped entirely — see the section above.
-
-If that retry also returns `403 FreeTierError` and `/health` shows `"lastError": null` with the current CLI version (for example `opencode/latest/2.0.32/cli`), **your current IP is in a temporary free-tier cooldown upstream**. To prevent extending the penalty, the bridge suppresses duplicate `403` retries and forced GitHub refreshes for `30s` (`GATE_RETRY_COOLDOWN_MS`). Running the official OpenCode CLI binary (`opencode run -m opencode/big-pickle "hi"`) from the same IP at the same moment returns the exact same `403 FreeTierError`. Wait for the per-IP window to reset or route through another host/SSH tunnel.
-
-### `429 RateLimitError` / `BUSY` in `verify.ts`
-
-Upstream is throttling the specific model or current IP due to capacity. Try another model ID from `/v1/models`.
-
-### `404 Model '<id>' has been retired upstream`
-
-The model was marked `status: "deprecated"` in `models.opencode.ai/api.json` (for example `cat-jam-free`, `muse-spark-1.3-contributor-free`, or `step-5-preview-free`). Query `curl -s http://127.0.0.1:20129/v1/models` and switch your client to one of the active models.
-
-### `bun: command not found` in a fresh SSH session
-
-The service runs fine, but `curl https://bun.sh/install | bash` only adds
-`~/.bun/bin` to an *interactive* shell's PATH. A new non-login SSH session, or a
-`sh -c` command, does not see it:
-
-```bash
-export PATH="$HOME/.bun/bin:$PATH"     # or use the absolute path
-/root/.bun/bin/bun transport-fingerprint.ts --check
-```
-
-The installer prints the absolute path in its closing summary for this reason.
-The service itself is unaffected: its unit file records the full path.
-
-### `remote port forwarding failed for listen port 20136`
-
-The receiving host still has a **stale** listener from a tunnel whose sender rebooted or lost power. The TCP connection died without a FIN, so `sshd` keeps the forwarded port until keepalive notices — ten minutes with the default `ClientAliveInterval 300` × `ClientAliveCountMax 2`. The replacement tunnel then fails even though its own unit is healthy.
-
-```bash
-./tunnel-doctor.sh              # which forwards are stale (listener with no SSH transport)
-./tunnel-doctor.sh --reap       # kill only the stale sessions
-./tunnel-doctor.sh --check      # is the keepalive window short enough?
-```
-
-To close the window itself, on the **receiving** host:
-
-```bash
-# /etc/ssh/sshd_config.d/00-keepalive.conf   — the 00- prefix matters
-ClientAliveInterval 30
-ClientAliveCountMax 4        # dead peer detected in 120s
-```
-
-OpenSSH uses the **first** value it reads, so a later-sorting file (for example `99-*.conf`) is silently ignored. Verify with `sshd -T | grep -i clientalive` and `systemctl reload ssh`.
-
-### `429 FreeUsageLimitError` — the quota, or a missing `<env>` block?
-
-`429 FreeUsageLimitError` has **two** causes, and the gateway uses the same
-message for both:
-
-1. the free-tier allowance is spent, or
-2. the request's system prompt is missing the harness environment block.
-
-Cause 2 is the one that made the bridge look throttled while the CLI worked.
-Reproduced by capturing the CLI's own request and replaying it byte-for-byte:
-the captured body answers `200`, the same body with only its system prompt
-replaced by a short one answers `429`. Same headers, same session id, same TLS
-stack — the difference is the body.
-
-The trigger is precise: an `<env>` block containing a `Working directory:` line.
-
-| system prompt | result |
-|---|---|
-| `You are a helpful assistant.` | `429` |
-| 12 KB of generic prompt text | `429` |
-| `<env>Working directory: /tmp</env>` (65 bytes) | `200` |
-| 12 KB generic prompt **plus** the env block | `200` |
-
-Length is not the rule, and neither is the model — `big-pickle` and
-`mimo-v2.6-flash-free` split the same way. Sending `tools: []` also produces
-this `429`, which is why an empty tool profile looked like a quota error too.
-
-### `429 FreeUsageLimitError` from a blocked tool name
-
-The quota wording also hides a tool-name filter. A request whose only fault is a
-tool named `run_code` is answered with the same `429 FreeUsageLimitError`, even
-when the system prompt, the headers and the token budget are identical to a
-request that answers `200`:
-
-| `tools[].function.name` | result |
-|---|---|
-| `run_code` | `429` |
-| `run_code_client` | `429` (the match is on the substring) |
-| `run-code` | `200` |
-| `runcode` | `200` |
-| `run_program` | `200` |
-| `code_exec` | `200` (same schema) |
-
-Sending the anchor tool `read` alongside `run_code` does not help, so this is not
-the shape gate and not the allowance. The bridge now sends such a tool upstream
-as `run_program` and restores the client's name on the way back, including
-streamed tool-call deltas, `tool_choice` and tool-result turns, so a client keeps
-its own tool name.
-
-The bridge has appended the block since the fix in this release: it derives the
-working directory, workspace root, git-repo flag and platform from its own
-process. A client that already forwards the CLI's prompt keeps its own block
-and does not get a duplicate. If you still see `429` on an up-to-date bridge,
-the allowance really is spent — check with the interleaving probe:
-
-```bash
-for i in 1 2 3; do
-  opencode run -m opencode/glm-5.3-flash-free "probe $i" 2>&1 | tail -1
-  curl -s http://127.0.0.1:20129/v1/chat/completions \
-    -H 'Content-Type: application/json' \
-    -d '{"model":"glm-5.3-flash-free","messages":[{"role":"user","content":"probe"}],"max_tokens":8}' \
-    | head -c 120; echo
-done
-```
-
-If both refuse, the allowance is spent. If the CLI answers while the bridge
-refuses **in the same minute** on a bridge older than this release, upgrade —
-that is the shape bug, not a quota.
-
-#### Why the bridge can be charged earlier than the CLI
-
-The default `TOOL_PROFILE_SCOPE=core` sends two tools (`read`, `shell`) and a
-short placeholder note, then escalates to `full` only after a rejection. The
-real CLI always sends the full profile. Measured against a captured CLI request
-(`opencode run`, v2.0.32) and this bridge on the same model:
-
-| | CLI | bridge, `core` | bridge, `full` |
-|---|---|---|---|
-| tools | 12 | 2 | 13 |
-| tool schema bytes | 13,991 | 2,522 | 13,972 |
-| system prompt chars | 12,259 | ~470 | ~470 |
-| `max_completion_tokens` | 32,000 | 5,120 | 5,120 |
-| total body bytes | 26,296 | ~3,300 | ~14,500 |
-
-`TOOL_PROFILE_SCOPE=full` closes the tool gap and is the safer default when a
-deployment is being throttled ahead of the CLI.
-
-The system-prompt gap is **not** cosmetic: before the `<env>` fix in this
-release it was the whole `429` cause. What remains after the fix is the CLI's
-harness prose (persona, communication rules, skill catalogue), which the bridge
-does not ship. That part is accepted by the gateway — the env block is the only
-anchor it checks — so the bridge no longer needs to reproduce the full prompt.
-
-```bash
-# systemd drop-in for a service that runs as a dedicated user
-sudo mkdir -p /etc/systemd/system/opencode-free-bridge.service.d
-printf '[Service]\nEnvironment=TOOL_PROFILE_SCOPE=full\n' \
-  | sudo tee /etc/systemd/system/opencode-free-bridge.service.d/10-tool-profile.conf
-sudo systemctl daemon-reload && sudo systemctl restart opencode-free-bridge.service
-```
-
-### Reverse tunnel dies while the process still looks healthy
-
-A deployment that reaches the bridge over `ssh -R` can fail in a way systemd
-cannot see: the `ssh` process stays `active`, the TCP connection stays `ESTAB`,
-and the listener on the far end is gone. `Restart=always` never fires because
-the process never exits. This cost two hours of downtime on a five-node
-deployment before it was diagnosed.
-
-The only reliable probe is the endpoint itself. Run it on the host that owns the
-forwarded port, not on the node:
-
-```bash
-#!/bin/bash
-# /usr/local/bin/opencode-tunnel-watchdog.sh — run as root via a systemd timer
-PORT=20136
-LOG=/var/log/opencode-tunnel-watchdog.log
-log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG"; }
-
-if ! curl -sf --max-time 5 http://127.0.0.1:20129/health >/dev/null; then
-  log "bridge DOWN - restarting"; systemctl restart opencode-bridge.service; sleep 4
-fi
-if ! pgrep -f "ssh .*-R 127.0.0.1:${PORT}:" >/dev/null; then
-  log "tunnel MISSING - restarting"; systemctl restart opencode-tunnel.service; sleep 6
-fi
-pgrep -f "ssh .*-R 127.0.0.1:${PORT}:" >/dev/null \
-  && log "SUMMARY ok" || log "SUMMARY FAILED - manual attention needed"
-```
-
-Pair it with a `oneshot` service and a `OnUnitActiveSec=60` timer. The
-`SUMMARY` line is deliberate: without a heartbeat, an empty log is
-indistinguishable from a watchdog that never ran.
-
-Restarting the tunnel from a remote host over SSH needs care. `Defaults use_pty`
-in `/etc/sudoers` makes `sudo -n` fail with "a password is required" even when
-`NOPASSWD` is granted, and a nested `ssh host "python3 -c \"...\""` mangles
-quotes. Run the watchdog **as root on the node itself** through systemd instead
-of driving it remotely.
-
-### Checking service logs
-
-```bash
-# Linux (systemd user or system service)
-journalctl --user -u opencode-free-bridge -n 50 --no-pager
-journalctl -u opencode-free-bridge -n 50 --no-pager
-
-# macOS (launchd)
-tail -50 ~/Library/Logs/opencode-free-bridge.log
-
-# Manual foreground run
-bun ~/.opencode-free-bridge/server.ts
-```
-
-## License and upstream data
-
-This project is licensed under [MIT](./LICENSE). `identity.ts` derives request identity and tool metadata from the [OpenCode source repository](https://github.com/anomalyco/opencode). Its offline fallback includes OpenCode `read` and `shell` tool descriptions and schema fields; related source-shaped fixtures appear in `test/identity.test.js`. See [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) for the OpenCode MIT notice and contributor credit.
+[MIT](./LICENSE). `identity.ts` derives request identity and tool metadata from the
+[OpenCode source repository](https://github.com/anomalyco/opencode); the OpenCode MIT notice and
+contributor credit are in [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
